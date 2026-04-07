@@ -61,18 +61,28 @@ class LLMEngine:
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
+        use_context_optimizer: bool = True,
     ) -> list[str]:
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+
+        # Cache-aware scheduling is handled by the Scheduler itself
+        self.scheduler.cache_aware = use_context_optimizer
+
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
+        first_token_time = None
+        start_time = perf_counter()
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
+            # Record TTFT on first decode step
+            if first_token_time is None and num_tokens < 0:
+                first_token_time = perf_counter() - start_time
             if use_tqdm:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)
@@ -88,6 +98,7 @@ class LLMEngine:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        total_time = perf_counter() - start_time
         if use_tqdm:
             pbar.close()
-        return outputs
+        return {"outputs": outputs, "ttft": first_token_time, "total_time": total_time}

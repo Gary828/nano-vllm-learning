@@ -14,6 +14,7 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.cache_aware = getattr(config, 'cache_aware', True)
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -21,14 +22,34 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
+    def _sort_waiting_by_prefix(self):
+        """Sort waiting queue to group sequences sharing the same prefix for better cache reuse."""
+        if len(self.waiting) <= 1:
+            return
+        bm = self.block_manager
+        def prefix_key(seq):
+            if seq.num_blocks >= 1:
+                tokens = seq.block(0)
+                if len(tokens) == bm.block_size:
+                    return bm.compute_hash(tokens)
+            return -1
+        self.waiting = deque(sorted(self.waiting, key=prefix_key))
+
     def schedule(self) -> tuple[list[Sequence], bool]:
+        if self.cache_aware and self.waiting:
+            self._sort_waiting_by_prefix()
         # prefill
         scheduled_seqs = []
         num_seqs = 0
         num_batched_tokens = 0
         while self.waiting and num_seqs < self.max_num_seqs:
             seq = self.waiting[0]
-            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
+            if self.cache_aware:
+                predicted_new = len(seq) - self.block_manager.count_cached_blocks(seq) * self.block_manager.block_size
+                predicted_new = max(predicted_new, 1)
+            else:
+                predicted_new = len(seq)
+            if num_batched_tokens + predicted_new > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
             num_seqs += 1
             self.block_manager.allocate(seq)
@@ -69,3 +90,20 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+    def get_cache_stats(self) -> dict:
+        """Get KV cache statistics."""
+        total_cached = 0
+        total_tokens = 0
+        for seq in self.waiting:
+            total_cached += seq.num_cached_tokens
+            total_tokens += len(seq)
+        for seq in self.running:
+            total_cached += seq.num_cached_tokens
+            total_tokens += len(seq)
+        cache_hit_rate = total_cached / total_tokens if total_tokens > 0 else 0.0
+        return {
+            "total_cached_tokens": total_cached,
+            "total_tokens": total_tokens,
+            "cache_hit_rate": cache_hit_rate,
+        }

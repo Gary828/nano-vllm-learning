@@ -53,8 +53,36 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
+    def count_cached_blocks(self, seq: Sequence) -> int:
+        """Count blocks that would cache-hit (both used and freed-but-not-overwritten)."""
+        h = -1
+        hits = 0
+        for i in range(seq.num_blocks):
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
+            block_id = self.hash_to_block_id.get(h, -1)
+            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                break
+            hits += 1
+        return hits
+
+    def count_reusable_blocks(self, seq: Sequence) -> int:
+        """Count blocks that would cache-hit on currently used blocks (no free block needed)."""
+        h = -1
+        hits = 0
+        for i in range(seq.num_blocks):
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
+            block_id = self.hash_to_block_id.get(h, -1)
+            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                break
+            if block_id in self.used_block_ids:
+                hits += 1
+        return hits
+
     def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+        reusable = self.count_reusable_blocks(seq)
+        return len(self.free_block_ids) >= (seq.num_blocks - reusable)
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
@@ -89,6 +117,13 @@ class BlockManager:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+
+    def reset_prefix_cache(self):
+        """Clear all prefix cache hash mappings. Blocks remain allocated but hashes are forgotten."""
+        self.hash_to_block_id.clear()
+        for block in self.blocks:
+            block.hash = -1
+            block.token_ids = []
 
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
