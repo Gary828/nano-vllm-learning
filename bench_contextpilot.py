@@ -17,9 +17,11 @@ Usage:
 """
 
 import os
-import sys
 import time
 import logging
+import argparse
+import io
+from contextlib import redirect_stdout
 from copy import deepcopy
 from random import randint, seed, shuffle, sample
 
@@ -82,7 +84,7 @@ def assemble_prompt(kb, doc_ids, query_tokens):
 # ContextPilot integration (offline, no server needed)
 # ---------------------------------------------------------------------------
 
-def apply_contextpilot(requests):
+def apply_contextpilot(requests, verbose=False):
     """
     Use ContextPilot to:
       1. Reorder docs within each request (intra-context) → create shared prefixes
@@ -94,8 +96,13 @@ def apply_contextpilot(requests):
     contexts = [req[0] for req in requests]
 
     # Step 1: Build index + intra-context reorder
-    idx = ContextIndex(alpha=0.001)
-    result = idx.fit_transform(contexts)
+    if verbose:
+        idx = ContextIndex(alpha=0.001)
+        result = idx.fit_transform(contexts)
+    else:
+        with redirect_stdout(io.StringIO()):
+            idx = ContextIndex(alpha=0.001)
+            result = idx.fit_transform(contexts)
 
     # Step 2: Inter-context scheduling
     scheduler = InterContextScheduler()
@@ -103,12 +110,12 @@ def apply_contextpilot(requests):
 
     # Reconstruct requests with reordered doc_ids + original queries
     reordered_requests = []
-    for i, orig_idx in enumerate(execution_order):
+    for orig_idx in execution_order:
         new_doc_ids = result.reordered_contexts[orig_idx]
         original_query = requests[orig_idx][1]
         reordered_requests.append((new_doc_ids, original_query))
 
-    return reordered_requests, execution_order
+    return reordered_requests, execution_order, result.stats
 
 
 # ---------------------------------------------------------------------------
@@ -130,13 +137,15 @@ def run_once(llm, prompts, cache_aware, max_tokens=1):
     total_out = sum(len(o["token_ids"]) for o in result["outputs"])
     return {
         "time": elapsed,
-        "ttft": result["ttft"],
+        "ttft": result.get("ttft"),  # alias for ttft_token
+        "ttft_token": result.get("ttft_token", result.get("ttft")),
+        "ttfd_decode_step": result.get("ttfd_decode_step"),
         "input_tokens": total_in,
         "output_tokens": total_out,
     }
 
 
-def benchmark_scenario(llm, kb, requests, label, max_tokens=1):
+def benchmark_scenario(llm, kb, requests, label, max_tokens=1, verbose_contextpilot=False):
     print(f"\n{'='*70}")
     print(f"Scenario: {label}")
     print(f"{'='*70}")
@@ -150,10 +159,11 @@ def benchmark_scenario(llm, kb, requests, label, max_tokens=1):
 
     # --- ContextPilot: reorder + schedule ---
     t_cp = time.perf_counter()
-    cp_requests, exec_order = apply_contextpilot(requests)
+    cp_requests, _, cp_stats = apply_contextpilot(requests, verbose=verbose_contextpilot)
     cp_time = time.perf_counter() - t_cp
     cp_prompts = [assemble_prompt(kb, r[0], r[1]) for r in cp_requests]
     print(f"  ContextPilot reorder time: {cp_time*1000:.1f}ms")
+    print(f"  ContextPilot index: {cp_stats.get('total_nodes', 0)} nodes, {cp_stats.get('leaf_nodes', 0)} leaves")
 
     # Show prefix sharing improvement
     def count_shared_prefix_tokens(prompts):
@@ -188,28 +198,62 @@ def benchmark_scenario(llm, kb, requests, label, max_tokens=1):
         print(f"  Run {i+1}/4: {name}...", end=" ", flush=True)
         flush_cache(llm)
         r = run_once(llm, deepcopy(prompts), cache_aware=ca, max_tokens=max_tokens)
-        ttft_str = f", TTFT={r['ttft']:.3f}s" if r['ttft'] else ""
-        print(f"{r['time']:.3f}s{ttft_str}")
+        metric_parts = []
+        if r["ttft_token"] is not None:
+            metric_parts.append(f"TTFT(token)={r['ttft_token']:.3f}s")
+        if r["ttfd_decode_step"] is not None:
+            metric_parts.append(f"TTFD(decode)={r['ttfd_decode_step']:.3f}s")
+        metric_suffix = f", {', '.join(metric_parts)}" if metric_parts else ""
+        print(f"{r['time']:.3f}s{metric_suffix}")
         results.append(r)
 
-    t_base = (results[0]["time"] + results[3]["time"]) / 2
-    t_cp = (results[1]["time"] + results[2]["time"]) / 2
+    t_base_generate = (results[0]["time"] + results[3]["time"]) / 2
+    t_cp_generate = (results[1]["time"] + results[2]["time"]) / 2
+
+    def avg_optional(a, b):
+        if a is not None and b is not None:
+            return (a + b) / 2
+        return a or b
+
+    ttft_token_b = avg_optional(results[0]["ttft_token"], results[3]["ttft_token"])
+    ttft_token_c = avg_optional(results[1]["ttft_token"], results[2]["ttft_token"])
+    ttfd_b = avg_optional(results[0]["ttfd_decode_step"], results[3]["ttfd_decode_step"])
+    ttfd_c = avg_optional(results[1]["ttfd_decode_step"], results[2]["ttfd_decode_step"])
+
+    ttft_token_b_str = f"{ttft_token_b:.3f}s" if ttft_token_b is not None else "n/a"
+    ttft_token_c_str = f"{ttft_token_c:.3f}s" if ttft_token_c is not None else "n/a"
+    ttfd_b_str = f"{ttfd_b:.3f}s" if ttfd_b is not None else "n/a"
+    ttfd_c_str = f"{ttfd_c:.3f}s" if ttfd_c is not None else "n/a"
+
+    base_total = t_base_generate
+    cp_total = cp_time + t_cp_generate
 
     print(f"\n  {'─'*50}")
-    print(f"  Baseline        — {t_base:.3f}s")
-    print(f"  ContextPilot    — {t_cp:.3f}s")
-    print(f"  Speedup:          {t_base/t_cp:.2f}x")
+    print("  Stage breakdown (avg of A-B-B-A runs)")
+    print("  Method         | ContextPilot Overhead | LLM Generate (prefill+decode) | End-to-end | TTFT(token) | TTFD(decode)")
+    print("  -------------- | --------------------- | ----------------------------- | ---------- | ----------- | ------------")
+    print(f"  Baseline       | {0.0:>19.3f}s | {t_base_generate:>27.3f}s | {base_total:>8.3f}s | {ttft_token_b_str:>11} | {ttfd_b_str:>12}")
+    print(f"  ContextPilot   | {cp_time:>19.3f}s | {t_cp_generate:>27.3f}s | {cp_total:>8.3f}s | {ttft_token_c_str:>11} | {ttfd_c_str:>12}")
+    print(f"  LLM-generate speedup: {t_base_generate/t_cp_generate:.2f}x")
+    print(f"  End-to-end speedup (incl. ContextPilot overhead): {base_total/cp_total:.2f}x")
 
-    def avg_ttft(a, b):
-        if a and b: return (a+b)/2
-        return a or b
-    ttft_b = avg_ttft(results[0]["ttft"], results[3]["ttft"])
-    ttft_c = avg_ttft(results[1]["ttft"], results[2]["ttft"])
-    if ttft_b and ttft_c:
-        print(f"  TTFT speedup:     {ttft_b/ttft_c:.2f}x")
+    if ttft_token_b is not None and ttft_token_c is not None and ttft_token_c > 0:
+        print(f"  TTFT(token) speedup: {ttft_token_b/ttft_token_c:.2f}x")
+    if ttfd_b is not None and ttfd_c is not None and ttfd_c > 0:
+        print(f"  TTFD(decode) speedup: {ttfd_b/ttfd_c:.2f}x")
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Benchmark ContextPilot + nano-vllm with clear stage breakdown output."
+    )
+    parser.add_argument(
+        "--verbose-contextpilot",
+        action="store_true",
+        help="Show detailed ContextPilot distance/clustering logs.",
+    )
+    args = parser.parse_args()
+
     model_path = "/root/study/lite_llama/my_weight/qwen3-0.6B"
     if not os.path.exists(model_path):
         print(f"Error: Model not found at {model_path}")
@@ -246,25 +290,29 @@ def main():
     kb1 = make_knowledge_base(num_docs=20, tokens_per_doc=256, seed_val=42)
     reqs1 = make_requests(kb1, num_requests=128, docs_per_request=5, query_len=64, seed_val=42)
     benchmark_scenario(llm, kb1, reqs1,
-        "20 docs x 256tok, 128 reqs picking 5 docs each", max_tokens=1)
+        "20 docs x 256tok, 128 reqs picking 5 docs each", max_tokens=1,
+        verbose_contextpilot=args.verbose_contextpilot)
 
     # ── Scenario 2: Longer docs, fewer reqs ──
     kb2 = make_knowledge_base(num_docs=15, tokens_per_doc=512, seed_val=123)
     reqs2 = make_requests(kb2, num_requests=64, docs_per_request=4, query_len=64, seed_val=123)
     benchmark_scenario(llm, kb2, reqs2,
-        "15 docs x 512tok, 64 reqs picking 4 docs each", max_tokens=1)
+        "15 docs x 512tok, 64 reqs picking 4 docs each", max_tokens=1,
+        verbose_contextpilot=args.verbose_contextpilot)
 
     # ── Scenario 3: With generation to show end-to-end benefit ──
     kb3 = make_knowledge_base(num_docs=20, tokens_per_doc=256, seed_val=456)
     reqs3 = make_requests(kb3, num_requests=128, docs_per_request=5, query_len=64, seed_val=456)
     benchmark_scenario(llm, kb3, reqs3,
-        "20x256tok, 128 reqs, max_tokens=32", max_tokens=32)
+        "20x256tok, 128 reqs, max_tokens=32", max_tokens=32,
+        verbose_contextpilot=args.verbose_contextpilot)
 
     # ── Scenario 4: High overlap (3 docs from pool of 8) ──
     kb4 = make_knowledge_base(num_docs=8, tokens_per_doc=512, seed_val=789)
     reqs4 = make_requests(kb4, num_requests=128, docs_per_request=3, query_len=64, seed_val=789)
     benchmark_scenario(llm, kb4, reqs4,
-        "8 docs x 512tok, 128 reqs picking 3 (high overlap)", max_tokens=1)
+        "8 docs x 512tok, 128 reqs picking 3 (high overlap)", max_tokens=1,
+        verbose_contextpilot=args.verbose_contextpilot)
 
     print(f"\n{'='*70}")
     print("Benchmark complete")

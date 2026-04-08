@@ -76,13 +76,23 @@ class LLMEngine:
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         first_token_time = None
+        first_decode_step_time = None
         start_time = perf_counter()
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
-            # Record TTFT on first decode step
-            if first_token_time is None and num_tokens < 0:
-                first_token_time = perf_counter() - start_time
+            # Record TTFT as time until the first output token becomes available.
+            # This can happen right after prefill (max_tokens=1) or during decode.
+            if first_token_time is None:
+                has_finished_output = len(output) > 0
+                has_running_completion = any(
+                    seq.num_completion_tokens > 0 for seq in self.scheduler.running
+                )
+                if has_finished_output or has_running_completion:
+                    first_token_time = perf_counter() - start_time
+            # Record time to first decode scheduling step (legacy TTFT interpretation).
+            if first_decode_step_time is None and num_tokens < 0:
+                first_decode_step_time = perf_counter() - start_time
             if use_tqdm:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)
@@ -101,4 +111,10 @@ class LLMEngine:
         total_time = perf_counter() - start_time
         if use_tqdm:
             pbar.close()
-        return {"outputs": outputs, "ttft": first_token_time, "total_time": total_time}
+        return {
+            "outputs": outputs,
+            "ttft": first_token_time,  # backward-compatible alias
+            "ttft_token": first_token_time,
+            "ttfd_decode_step": first_decode_step_time,
+            "total_time": total_time,
+        }
