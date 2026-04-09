@@ -13,15 +13,18 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None
-    eos: int = -1
+    eos: int | set = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     cache_aware: bool = True
+    kv_quant_bits: int | None = None
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
-        self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.kv_quant_bits is not None:
+            assert self.kv_quant_bits in (3, 4)
+        self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
