@@ -1,3 +1,6 @@
+# 目前参考的 TurboQuant 实现有问题，所以main分支已清理有关的代码
+下面的方案仅作参考
+
 # TurboQuant × ContextPilot 集成总方案（nano-vllm）
 
 > 目标：在不破坏当前 `nano-vllm` 主干（含 cache-aware 调度与 ContextPilot 基准链路）的前提下，增量引入 TurboQuant KV 压缩能力，并建立可复现实验体系，系统比较不同组合的效果。
