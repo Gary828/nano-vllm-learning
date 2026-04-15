@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.layers.kv_quant import estimate_quantized_block_bytes
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -27,7 +28,7 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
+        self.enforce_eager = config.enforce_eager or config.kv_cache_quant
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -116,15 +117,62 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        if config.kv_cache_quant:
+            block_bytes = estimate_quantized_block_bytes(
+                hf_config.num_hidden_layers,
+                self.block_size,
+                num_kv_heads,
+                head_dim,
+            )
+        else:
+            block_bytes = (
+                2
+                * hf_config.num_hidden_layers
+                * self.block_size
+                * num_kv_heads
+                * head_dim
+                * hf_config.torch_dtype.itemsize
+            )
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        if config.kv_cache_quant:
+            self.kv_cache = torch.empty(
+                2,
+                hf_config.num_hidden_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                num_kv_heads,
+                head_dim,
+                dtype=torch.int8,
+            )
+        else:
+            self.kv_cache = torch.empty(
+                2,
+                hf_config.num_hidden_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                num_kv_heads,
+                head_dim,
+            )
+        self.kv_scale = None
+        if config.kv_cache_quant:
+            self.kv_scale = torch.empty(
+                2,
+                hf_config.num_hidden_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                num_kv_heads,
+                dtype=torch.float32,
+            )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                if config.kv_cache_quant:
+                    module.k_scale = self.kv_scale[0, layer_id]
+                    module.v_scale = self.kv_scale[1, layer_id]
+                    module.kv_cache_quant = True
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
