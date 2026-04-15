@@ -7,7 +7,11 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.layers.kv_quant import estimate_quantized_block_bytes
+from nanovllm.layers.kv_quant import (
+    estimate_quantized_block_bytes,
+    get_kv_cache_storage_dtype,
+    kv_cache_quant_uses_scale,
+)
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -123,6 +127,7 @@ class ModelRunner:
                 self.block_size,
                 num_kv_heads,
                 head_dim,
+                config.kv_cache_quant,
             )
         else:
             block_bytes = (
@@ -136,6 +141,7 @@ class ModelRunner:
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         if config.kv_cache_quant:
+            cache_dtype = get_kv_cache_storage_dtype(config.kv_cache_quant)
             self.kv_cache = torch.empty(
                 2,
                 hf_config.num_hidden_layers,
@@ -143,7 +149,7 @@ class ModelRunner:
                 self.block_size,
                 num_kv_heads,
                 head_dim,
-                dtype=torch.int8,
+                dtype=cache_dtype,
             )
         else:
             self.kv_cache = torch.empty(
@@ -155,7 +161,7 @@ class ModelRunner:
                 head_dim,
             )
         self.kv_scale = None
-        if config.kv_cache_quant:
+        if config.kv_cache_quant and kv_cache_quant_uses_scale(config.kv_cache_quant):
             self.kv_scale = torch.empty(
                 2,
                 hf_config.num_hidden_layers,
@@ -170,9 +176,10 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 if config.kv_cache_quant:
-                    module.k_scale = self.kv_scale[0, layer_id]
-                    module.v_scale = self.kv_scale[1, layer_id]
-                    module.kv_cache_quant = True
+                    module.kv_cache_quant = config.kv_cache_quant
+                    if self.kv_scale is not None:
+                        module.k_scale = self.kv_scale[0, layer_id]
+                        module.v_scale = self.kv_scale[1, layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):

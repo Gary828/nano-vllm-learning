@@ -5,6 +5,7 @@ import random
 import torch
 
 from nanovllm import LLM, SamplingParams
+from nanovllm.layers.kv_quant import normalize_kv_cache_quant_dtype
 
 
 def build_passkey_prompt(length: int, passkey: int) -> str:
@@ -29,12 +30,13 @@ def load_prompts() -> list[str]:
     return prompts
 
 
-def run_generation(model_path: str, prompts: list[str], kv_cache_quant: bool, max_tokens: int):
+def run_generation(model_path: str, prompts: list[str], kv_cache_quant, max_tokens: int):
     torch.manual_seed(0)
     torch.cuda.empty_cache()
+    quant_mode = normalize_kv_cache_quant_dtype(kv_cache_quant)
     llm = LLM(
         model_path,
-        kv_cache_quant=kv_cache_quant,
+        kv_cache_quant=quant_mode,
         enforce_eager=False,
         max_model_len=32768,
         max_num_batched_tokens=32768,
@@ -70,6 +72,7 @@ def main():
     parser = argparse.ArgumentParser(description="Compare generation quality with and without KV cache quantization.")
     parser.add_argument("--model-path", default="/root/study/lite_llama/my_weight/qwen3-0.6B")
     parser.add_argument("--max-tokens", type=int, default=24)
+    parser.add_argument("--quant-mode", default="int8", help="int8, fp8_e4m3fn, or fp8_e5m2")
     args = parser.parse_args()
 
     if not os.path.exists(args.model_path):
@@ -78,7 +81,7 @@ def main():
 
     prompts = load_prompts()
     base_outputs = run_generation(args.model_path, prompts, False, args.max_tokens)
-    quant_outputs = run_generation(args.model_path, prompts, True, args.max_tokens)
+    quant_outputs = run_generation(args.model_path, prompts, args.quant_mode, args.max_tokens)
     compare_outputs(base_outputs, quant_outputs)
 
 

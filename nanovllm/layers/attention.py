@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from nanovllm.layers.kv_quant import materialize_paged_kvcache, store_kvcache_int8
+from nanovllm.layers.kv_quant import materialize_paged_kvcache, store_kvcache_quantized
 from nanovllm.utils.context import get_context
 
 
@@ -55,13 +55,22 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-        self.kv_cache_quant = False
+        self.kv_cache_quant = None
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale = self.v_scale = torch.tensor([])
 
     def _store_paged_kv_cache(self, k: torch.Tensor, v: torch.Tensor, slot_mapping: torch.Tensor):
         if self.kv_cache_quant:
-            store_kvcache_int8(k, v, self.k_cache, self.v_cache, self.k_scale, self.v_scale, slot_mapping)
+            store_kvcache_quantized(
+                k,
+                v,
+                self.k_cache,
+                self.v_cache,
+                self.k_scale if self.k_scale.numel() else None,
+                self.v_scale if self.v_scale.numel() else None,
+                slot_mapping,
+                self.kv_cache_quant,
+            )
         else:
             store_kvcache(k, v, self.k_cache, self.v_cache, slot_mapping)
 
@@ -70,10 +79,11 @@ class Attention(nn.Module):
             return materialize_paged_kvcache(
                 self.k_cache,
                 self.v_cache,
-                self.k_scale,
-                self.v_scale,
+                self.k_scale if self.k_scale.numel() else None,
+                self.v_scale if self.v_scale.numel() else None,
                 block_tables,
                 out_dtype,
+                self.kv_cache_quant,
             )
         return self.k_cache, self.v_cache, block_tables
 
