@@ -83,6 +83,7 @@ class LLMEngine:
         first_token_time = None
         first_decode_step_time = None
         per_request_ttft = {}
+        per_request_completion_time = {}
         start_time = perf_counter()
         while not self.is_finished():
             t = perf_counter()
@@ -117,12 +118,15 @@ class LLMEngine:
                 })
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
+                if seq_id not in per_request_completion_time:
+                    per_request_completion_time[seq_id] = elapsed
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         total_time = perf_counter() - start_time
         per_request_ttft = [per_request_ttft.get(seq_id) for seq_id in request_seq_ids]
+        per_request_completion_time = [per_request_completion_time.get(seq_id) for seq_id in request_seq_ids]
         if use_tqdm:
             pbar.close()
         return {
@@ -131,6 +135,7 @@ class LLMEngine:
             "ttft_token": first_token_time,
             "batch_first_token_time": first_token_time,
             "per_request_ttft": per_request_ttft,
+            "per_request_completion_time": per_request_completion_time,
             "ttfd_decode_step": first_decode_step_time,
             "total_time": total_time,
         }
