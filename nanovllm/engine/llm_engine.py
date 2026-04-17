@@ -47,6 +47,7 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq.seq_id
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
@@ -74,16 +75,19 @@ class LLMEngine:
         # Cache-aware scheduling is handled by the Scheduler itself
         self.scheduler.cache_aware = use_context_optimizer
 
+        request_seq_ids = []
         for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+            request_seq_ids.append(self.add_request(prompt, sp))
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         first_token_time = None
         first_decode_step_time = None
+        per_request_ttft = {}
         start_time = perf_counter()
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
+            elapsed = perf_counter() - start_time
             # Record TTFT as time until the first output token becomes available.
             # This can happen right after prefill (max_tokens=1) or during decode.
             if first_token_time is None:
@@ -92,10 +96,16 @@ class LLMEngine:
                     seq.num_completion_tokens > 0 for seq in self.scheduler.running
                 )
                 if has_finished_output or has_running_completion:
-                    first_token_time = perf_counter() - start_time
+                    first_token_time = elapsed
+            for seq in self.scheduler.running:
+                if seq.num_completion_tokens > 0 and seq.seq_id not in per_request_ttft:
+                    per_request_ttft[seq.seq_id] = elapsed
+            for seq_id, _ in output:
+                if seq_id not in per_request_ttft:
+                    per_request_ttft[seq_id] = elapsed
             # Record time to first decode scheduling step (legacy TTFT interpretation).
             if first_decode_step_time is None and num_tokens < 0:
-                first_decode_step_time = perf_counter() - start_time
+                first_decode_step_time = elapsed
             if use_tqdm:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)
@@ -112,12 +122,15 @@ class LLMEngine:
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         total_time = perf_counter() - start_time
+        per_request_ttft = [per_request_ttft.get(seq_id) for seq_id in request_seq_ids]
         if use_tqdm:
             pbar.close()
         return {
             "outputs": outputs,
             "ttft": first_token_time,  # backward-compatible alias
             "ttft_token": first_token_time,
+            "batch_first_token_time": first_token_time,
+            "per_request_ttft": per_request_ttft,
             "ttfd_decode_step": first_decode_step_time,
             "total_time": total_time,
         }

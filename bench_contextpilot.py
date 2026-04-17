@@ -127,6 +127,40 @@ def flush_cache(llm):
     llm.scheduler.block_manager.reset_prefix_cache()
 
 
+def percentile(values, q):
+    """Linear-interpolated percentile for a list of numeric values."""
+    values = sorted(v for v in values if v is not None)
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    pos = (len(values) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(values) - 1)
+    frac = pos - lo
+    return values[lo] * (1 - frac) + values[hi] * frac
+
+
+def summarize_ttft(values):
+    """Return mean/p50/p95 summary, skipping missing values."""
+    values = [v for v in values if v is not None]
+    if not values:
+        return None
+    return {
+        "mean": sum(values) / len(values),
+        "p50": percentile(values, 0.50),
+        "p95": percentile(values, 0.95),
+    }
+
+
+def merge_ttft_lists(*lists):
+    merged = []
+    for values in lists:
+        if values:
+            merged.extend(v for v in values if v is not None)
+    return merged
+
+
 def run_once(llm, prompts, cache_aware, max_tokens=1):
     sp = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=max_tokens)
           for _ in range(len(prompts))]
@@ -137,8 +171,11 @@ def run_once(llm, prompts, cache_aware, max_tokens=1):
     total_out = sum(len(o["token_ids"]) for o in result["outputs"])
     return {
         "time": elapsed,
-        "ttft": result.get("ttft"),  # alias for ttft_token
-        "ttft_token": result.get("ttft_token", result.get("ttft")),
+        "batch_first_token_time": result.get(
+            "batch_first_token_time",
+            result.get("ttft_token", result.get("ttft")),
+        ),
+        "per_request_ttft": result.get("per_request_ttft", []),
         "ttfd_decode_step": result.get("ttfd_decode_step"),
         "input_tokens": total_in,
         "output_tokens": total_out,
@@ -199,8 +236,8 @@ def benchmark_scenario(llm, kb, requests, label, max_tokens=1, verbose_contextpi
         flush_cache(llm)
         r = run_once(llm, deepcopy(prompts), cache_aware=ca, max_tokens=max_tokens)
         metric_parts = []
-        if r["ttft_token"] is not None:
-            metric_parts.append(f"TTFT(token)={r['ttft_token']:.3f}s")
+        if r["batch_first_token_time"] is not None:
+            metric_parts.append(f"batch-first-token={r['batch_first_token_time']:.3f}s")
         if r["ttfd_decode_step"] is not None:
             metric_parts.append(f"TTFD(decode)={r['ttfd_decode_step']:.3f}s")
         metric_suffix = f", {', '.join(metric_parts)}" if metric_parts else ""
@@ -215,13 +252,26 @@ def benchmark_scenario(llm, kb, requests, label, max_tokens=1, verbose_contextpi
             return (a + b) / 2
         return a or b
 
-    ttft_token_b = avg_optional(results[0]["ttft_token"], results[3]["ttft_token"])
-    ttft_token_c = avg_optional(results[1]["ttft_token"], results[2]["ttft_token"])
+    batch_first_token_b = avg_optional(
+        results[0]["batch_first_token_time"],
+        results[3]["batch_first_token_time"],
+    )
+    batch_first_token_c = avg_optional(
+        results[1]["batch_first_token_time"],
+        results[2]["batch_first_token_time"],
+    )
     ttfd_b = avg_optional(results[0]["ttfd_decode_step"], results[3]["ttfd_decode_step"])
     ttfd_c = avg_optional(results[1]["ttfd_decode_step"], results[2]["ttfd_decode_step"])
 
-    ttft_token_b_str = f"{ttft_token_b:.3f}s" if ttft_token_b is not None else "n/a"
-    ttft_token_c_str = f"{ttft_token_c:.3f}s" if ttft_token_c is not None else "n/a"
+    per_request_b = summarize_ttft(
+        merge_ttft_lists(results[0]["per_request_ttft"], results[3]["per_request_ttft"])
+    )
+    per_request_c = summarize_ttft(
+        merge_ttft_lists(results[1]["per_request_ttft"], results[2]["per_request_ttft"])
+    )
+
+    batch_first_token_b_str = f"{batch_first_token_b:.3f}s" if batch_first_token_b is not None else "n/a"
+    batch_first_token_c_str = f"{batch_first_token_c:.3f}s" if batch_first_token_c is not None else "n/a"
     ttfd_b_str = f"{ttfd_b:.3f}s" if ttfd_b is not None else "n/a"
     ttfd_c_str = f"{ttfd_c:.3f}s" if ttfd_c is not None else "n/a"
 
@@ -230,17 +280,38 @@ def benchmark_scenario(llm, kb, requests, label, max_tokens=1, verbose_contextpi
 
     print(f"\n  {'─'*50}")
     print("  Stage breakdown (avg of A-B-B-A runs)")
-    print("  Method         | ContextPilot Overhead | LLM Generate (prefill+decode) | End-to-end | TTFT(token) | TTFD(decode)")
-    print("  -------------- | --------------------- | ----------------------------- | ---------- | ----------- | ------------")
-    print(f"  Baseline       | {0.0:>19.3f}s | {t_base_generate:>27.3f}s | {base_total:>8.3f}s | {ttft_token_b_str:>11} | {ttfd_b_str:>12}")
-    print(f"  ContextPilot   | {cp_time:>19.3f}s | {t_cp_generate:>27.3f}s | {cp_total:>8.3f}s | {ttft_token_c_str:>11} | {ttfd_c_str:>12}")
+    print("  Method         | ContextPilot Overhead | LLM Generate (prefill+decode) | End-to-end | Batch First-Token | TTFD(decode)")
+    print("  -------------- | --------------------- | ----------------------------- | ---------- | ----------------- | ------------")
+    print(f"  Baseline       | {0.0:>19.3f}s | {t_base_generate:>27.3f}s | {base_total:>8.3f}s | {batch_first_token_b_str:>17} | {ttfd_b_str:>12}")
+    print(f"  ContextPilot   | {cp_time:>19.3f}s | {t_cp_generate:>27.3f}s | {cp_total:>8.3f}s | {batch_first_token_c_str:>17} | {ttfd_c_str:>12}")
     print(f"  LLM-generate speedup: {t_base_generate/t_cp_generate:.2f}x")
     print(f"  End-to-end speedup (incl. ContextPilot overhead): {base_total/cp_total:.2f}x")
 
-    if ttft_token_b is not None and ttft_token_c is not None and ttft_token_c > 0:
-        print(f"  TTFT(token) speedup: {ttft_token_b/ttft_token_c:.2f}x")
+    if batch_first_token_b is not None and batch_first_token_c is not None and batch_first_token_c > 0:
+        print(f"  Batch first-token speedup: {batch_first_token_b/batch_first_token_c:.2f}x")
     if ttfd_b is not None and ttfd_c is not None and ttfd_c > 0:
         print(f"  TTFD(decode) speedup: {ttfd_b/ttfd_c:.2f}x")
+
+    if per_request_b and per_request_c:
+        print()
+        print("  Per-request TTFT (merged across A-B-B-A runs)")
+        print("  Method         | Mean        | P50         | P95")
+        print("  -------------- | ----------- | ----------- | -----------")
+        print(
+            f"  Baseline       | {per_request_b['mean']:>9.3f}s | "
+            f"{per_request_b['p50']:>9.3f}s | {per_request_b['p95']:>9.3f}s"
+        )
+        print(
+            f"  ContextPilot   | {per_request_c['mean']:>9.3f}s | "
+            f"{per_request_c['p50']:>9.3f}s | {per_request_c['p95']:>9.3f}s"
+        )
+        if per_request_c["mean"] > 0 and per_request_c["p50"] > 0 and per_request_c["p95"] > 0:
+            print(
+                "  Per-request TTFT speedup: "
+                f"mean {per_request_b['mean']/per_request_c['mean']:.2f}x, "
+                f"p50 {per_request_b['p50']/per_request_c['p50']:.2f}x, "
+                f"p95 {per_request_b['p95']/per_request_c['p95']:.2f}x"
+            )
 
 
 def main():
