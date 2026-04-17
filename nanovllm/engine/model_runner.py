@@ -22,6 +22,9 @@ def get_model_class(hf_config):
     if "MiniCPM" in arch:
         from nanovllm.models.minicpm import MiniCPMForCausalLM
         return MiniCPMForCausalLM
+    if "Llama" in arch:
+        from nanovllm.models.llama import LlamaForCausalLM
+        return LlamaForCausalLM
     from nanovllm.models.qwen3 import Qwen3ForCausalLM
     return Qwen3ForCausalLM
 
