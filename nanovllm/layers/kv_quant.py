@@ -72,6 +72,56 @@ def gather_dequant_int8_kernel(
     tl.store(out_ptrs, out, mask=d_mask)
 
 
+@triton.jit
+def quantize_store_int8_kernel(
+    in_ptr,
+    in_stride_row,
+    in_stride_head,
+    in_stride_dim,
+    slots_ptr,
+    cache_ptr,
+    cache_stride_row,
+    cache_stride_head,
+    cache_stride_dim,
+    scale_ptr,
+    scale_stride_row,
+    scale_stride_head,
+    num_rows,
+    head_dim,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(axis=0)
+    head = tl.program_id(axis=1)
+    offs_d = tl.arange(0, BLOCK_D)
+    d_mask = offs_d < head_dim
+    row_mask = row < num_rows
+
+    x_ptrs = (
+        in_ptr
+        + row * in_stride_row
+        + head * in_stride_head
+        + offs_d * in_stride_dim
+    )
+    x = tl.load(x_ptrs, mask=row_mask & d_mask, other=0.0).to(tl.float32)
+    abs_x = tl.abs(x)
+    max_abs = tl.max(abs_x, axis=0)
+    scale = tl.maximum(max_abs / 127.0, 1e-8)
+    q = x / scale
+    q = tl.maximum(tl.minimum(q, 127.0), -127.0)
+    q = tl.extra.cuda.libdevice.rint(q).to(tl.int8)
+
+    slot = tl.load(slots_ptr + row, mask=row_mask, other=0)
+    cache_ptrs = (
+        cache_ptr
+        + slot * cache_stride_row
+        + head * cache_stride_head
+        + offs_d * cache_stride_dim
+    )
+    tl.store(cache_ptrs, q, mask=row_mask & d_mask)
+    scale_loc = scale_ptr + slot * scale_stride_row + head * scale_stride_head
+    tl.store(scale_loc, scale, mask=row_mask)
+
+
 def _next_power_of_2(n: int) -> int:
     if n <= 1:
         return 1
@@ -127,6 +177,56 @@ def _gather_dequant_int8_fused(
         BLOCK_D=block_d,
     )
     return out
+
+
+def _quantize_store_int8_fused(
+    x: torch.Tensor,
+    slots: torch.Tensor,
+    cache: torch.Tensor,
+    scale: torch.Tensor,
+) -> bool:
+    if not x.is_cuda or not slots.is_cuda or not cache.is_cuda or not scale.is_cuda:
+        return False
+    if (
+        x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or slots.dtype != torch.int64
+        or cache.dtype != torch.int8
+        or scale.dtype != torch.float32
+    ):
+        return False
+    if x.dim() != 3:
+        return False
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not slots.is_contiguous():
+        slots = slots.contiguous()
+
+    n, num_heads, head_dim = x.shape
+    if n == 0:
+        return True
+
+    block_d = min(256, _next_power_of_2(head_dim))
+    grid = (n, num_heads)
+    cache_2d = cache.view(-1, cache.size(-2), cache.size(-1))
+    scale_2d = scale.view(-1, scale.size(-1))
+    quantize_store_int8_kernel[grid](
+        x,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        slots,
+        cache_2d,
+        cache_2d.stride(0),
+        cache_2d.stride(1),
+        cache_2d.stride(2),
+        scale_2d,
+        scale_2d.stride(0),
+        scale_2d.stride(1),
+        n,
+        head_dim,
+        BLOCK_D=block_d,
+    )
+    return True
 
 
 def build_local_block_tables(block_tables: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -219,12 +319,18 @@ def store_kvcache_int8(
     if not torch.any(valid):
         return
     slots = slot_mapping[valid].to(torch.int64)
-    key_q, key_scale = _quantize_per_token_head(key[valid])
-    value_q, value_scale = _quantize_per_token_head(value[valid])
     flat_k_cache = k_cache.view(-1, k_cache.size(-2), k_cache.size(-1))
     flat_v_cache = v_cache.view(-1, v_cache.size(-2), v_cache.size(-1))
     flat_k_scale = k_scale.view(-1, k_scale.size(-1))
     flat_v_scale = v_scale.view(-1, v_scale.size(-1))
+    key_valid = key[valid]
+    value_valid = value[valid]
+    k_ok = _quantize_store_int8_fused(key_valid, slots, flat_k_cache, flat_k_scale)
+    v_ok = _quantize_store_int8_fused(value_valid, slots, flat_v_cache, flat_v_scale)
+    if k_ok and v_ok:
+        return
+    key_q, key_scale = _quantize_per_token_head(key_valid)
+    value_q, value_scale = _quantize_per_token_head(value_valid)
     flat_k_cache[slots] = key_q
     flat_v_cache[slots] = value_q
     flat_k_scale[slots] = key_scale

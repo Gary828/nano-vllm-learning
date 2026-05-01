@@ -58,6 +58,8 @@ class Attention(nn.Module):
         self.kv_cache_quant = None
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale = self.v_scale = torch.tensor([])
+        self._cached_block_tables = None
+        self._cached_materialized = None
 
     def _store_paged_kv_cache(self, k: torch.Tensor, v: torch.Tensor, slot_mapping: torch.Tensor):
         if self.kv_cache_quant:
@@ -75,8 +77,16 @@ class Attention(nn.Module):
             store_kvcache(k, v, self.k_cache, self.v_cache, slot_mapping)
 
     def _materialize_cached_kv(self, block_tables: torch.Tensor, out_dtype: torch.dtype):
+        if self.kv_cache_quant and (not getattr(get_context(), "is_prefill", False)):
+            if (
+                self._cached_block_tables is not None
+                and self._cached_materialized is not None
+                and self._cached_block_tables.shape == block_tables.shape
+                and torch.equal(self._cached_block_tables, block_tables)
+            ):
+                return self._cached_materialized
         if self.kv_cache_quant:
-            return materialize_paged_kvcache(
+            materialized = materialize_paged_kvcache(
                 self.k_cache,
                 self.v_cache,
                 self.k_scale if self.k_scale.numel() else None,
@@ -85,6 +95,15 @@ class Attention(nn.Module):
                 out_dtype,
                 self.kv_cache_quant,
             )
+            if not getattr(get_context(), "is_prefill", False):
+                self._cached_block_tables = block_tables.clone()
+                self._cached_materialized = materialized
+            else:
+                self._cached_block_tables = None
+                self._cached_materialized = None
+            return materialized
+        self._cached_block_tables = None
+        self._cached_materialized = None
         return self.k_cache, self.v_cache, block_tables
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
