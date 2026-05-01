@@ -173,3 +173,34 @@ def test_materialize_quantized_blocks_int8_subset():
     assert torch.allclose(k_fp[1], k_cache[1].float())
     assert torch.allclose(v_fp[0], v_cache[3].float())
     assert torch.allclose(v_fp[1], v_cache[1].float())
+
+
+def test_materialize_quantized_blocks_int8_bfloat16_output():
+    k_cache = torch.tensor(
+        [
+            [[[1, 2], [3, 4]], [[5, 6], [7, 8]]],
+            [[[9, 10], [11, 12]], [[13, 14], [15, 16]]],
+        ],
+        dtype=torch.int8,
+    )
+    v_cache = (k_cache * 2).to(torch.int8)
+    k_scale = torch.full((2, 2, 2), 0.5, dtype=torch.float32)
+    v_scale = torch.full((2, 2, 2), 0.25, dtype=torch.float32)
+    block_ids = torch.tensor([1, 0], dtype=torch.int64)
+
+    k_fp, v_fp = materialize_quantized_blocks(
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        block_ids,
+        torch.bfloat16,
+        "int8",
+    )
+
+    assert k_fp.dtype == torch.bfloat16
+    assert v_fp.dtype == torch.bfloat16
+    expected_k = torch.index_select(k_cache, 0, block_ids).float() * 0.5
+    expected_v = torch.index_select(v_cache, 0, block_ids).float() * 0.25
+    assert torch.allclose(k_fp.float(), expected_k, atol=1e-3)
+    assert torch.allclose(v_fp.float(), expected_v, atol=1e-3)

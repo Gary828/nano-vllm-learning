@@ -1,4 +1,6 @@
 import torch
+import triton
+import triton.language as tl
 
 
 KV_CACHE_QUANT_DTYPES = {
@@ -31,6 +33,102 @@ def kv_cache_quant_uses_scale(mode) -> bool:
     return normalize_kv_cache_quant_dtype(mode) == "int8"
 
 
+@triton.jit
+def gather_dequant_int8_kernel(
+    cache_ptr,
+    scale_ptr,
+    block_ids_ptr,
+    out_ptr,
+    num_rows,
+    num_heads,
+    head_dim,
+    block_size,
+    cache_stride_row,
+    cache_stride_head,
+    cache_stride_dim,
+    scale_stride_row,
+    scale_stride_head,
+    out_stride_row,
+    out_stride_head,
+    out_stride_dim,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(axis=0)
+    head = tl.program_id(axis=1)
+    chunk = tl.program_id(axis=2)
+    offs_d = chunk * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = offs_d < head_dim
+
+    block_pos = row // block_size
+    token_pos = row - block_pos * block_size
+    src_block = tl.load(block_ids_ptr + block_pos)
+    src_row = src_block * block_size + token_pos
+
+    cache_ptrs = cache_ptr + src_row * cache_stride_row + head * cache_stride_head + offs_d * cache_stride_dim
+    q = tl.load(cache_ptrs, mask=d_mask, other=0).to(tl.float32)
+    scale = tl.load(scale_ptr + src_row * scale_stride_row + head * scale_stride_head)
+    out = q * scale
+    out_ptrs = out_ptr + row * out_stride_row + head * out_stride_head + offs_d * out_stride_dim
+    tl.store(out_ptrs, out, mask=d_mask)
+
+
+def _next_power_of_2(n: int) -> int:
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def _gather_dequant_int8_fused(
+    cache: torch.Tensor,
+    scale: torch.Tensor,
+    block_ids: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if not cache.is_cuda or not scale.is_cuda or not block_ids.is_cuda:
+        return None
+    if not cache.is_contiguous() or not scale.is_contiguous() or not block_ids.is_contiguous():
+        return None
+    if cache.dtype != torch.int8 or scale.dtype != torch.float32:
+        return None
+    if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return None
+
+    num_selected = int(block_ids.numel())
+    block_size = int(cache.size(1))
+    num_heads = int(cache.size(2))
+    head_dim = int(cache.size(3))
+    out = torch.empty((num_selected, block_size, num_heads, head_dim), dtype=out_dtype, device=cache.device)
+    if num_selected == 0:
+        return out
+
+    rows = num_selected * block_size
+    block_d = min(256, _next_power_of_2(head_dim))
+    grid = (rows, num_heads, triton.cdiv(head_dim, block_d))
+    cache_2d = cache.view(-1, num_heads, head_dim)
+    scale_2d = scale.view(-1, num_heads)
+    out_3d = out.view(rows, num_heads, head_dim)
+    gather_dequant_int8_kernel[grid](
+        cache_2d,
+        scale_2d,
+        block_ids,
+        out_3d,
+        rows,
+        num_heads,
+        head_dim,
+        block_size,
+        cache_2d.stride(0),
+        cache_2d.stride(1),
+        cache_2d.stride(2),
+        scale_2d.stride(0),
+        scale_2d.stride(1),
+        out_3d.stride(0),
+        out_3d.stride(1),
+        out_3d.stride(2),
+        BLOCK_D=block_d,
+    )
+    return out
+
+
 def build_local_block_tables(block_tables: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     valid_mask = block_tables >= 0
     local_block_tables = torch.full_like(block_tables, -1)
@@ -57,9 +155,13 @@ def materialize_quantized_blocks(
         empty = torch.empty(0, *k_cache.shape[1:], dtype=out_dtype, device=k_cache.device)
         return empty, empty.clone()
     if quant_dtype == "int8":
+        assert k_scale is not None and v_scale is not None
+        k_fp = _gather_dequant_int8_fused(k_cache, k_scale, block_ids, out_dtype)
+        v_fp = _gather_dequant_int8_fused(v_cache, v_scale, block_ids, out_dtype)
+        if k_fp is not None and v_fp is not None:
+            return k_fp.contiguous(), v_fp.contiguous()
         k_fp32 = torch.index_select(k_cache, 0, block_ids).to(torch.float32)
         v_fp32 = torch.index_select(v_cache, 0, block_ids).to(torch.float32)
-        assert k_scale is not None and v_scale is not None
         k_scale_used = torch.index_select(k_scale, 0, block_ids)
         v_scale_used = torch.index_select(v_scale, 0, block_ids)
         k_fp32.mul_(k_scale_used.unsqueeze(-1))
