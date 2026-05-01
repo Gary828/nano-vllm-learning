@@ -1,7 +1,9 @@
 import torch
 
 from nanovllm.layers.kv_quant import (
+    build_local_block_tables,
     estimate_quantized_block_bytes,
+    materialize_quantized_blocks,
     normalize_kv_cache_quant_dtype,
     materialize_paged_kvcache,
     store_kvcache_fp8,
@@ -139,3 +141,35 @@ def test_materialize_paged_kvcache_respects_output_dtype():
     assert v_fp.dtype == torch.float16
     assert torch.allclose(k_fp.float(), torch.full_like(k_fp.float(), 0.5))
     assert torch.allclose(v_fp.float(), torch.full_like(v_fp.float(), 0.25))
+
+
+def test_build_local_block_tables():
+    block_tables = torch.tensor([[2, -1, 0], [0, 2, -1]], dtype=torch.int32)
+    valid_mask, unique_blocks, local_block_tables = build_local_block_tables(block_tables)
+
+    assert torch.equal(valid_mask, torch.tensor([[True, False, True], [True, True, False]]))
+    assert torch.equal(unique_blocks, torch.tensor([0, 2], dtype=torch.int64))
+    assert torch.equal(local_block_tables, torch.tensor([[1, -1, 0], [0, 1, -1]], dtype=torch.int32))
+
+
+def test_materialize_quantized_blocks_int8_subset():
+    k_cache = torch.arange(4 * 2 * 1 * 2, dtype=torch.int8).view(4, 2, 1, 2)
+    v_cache = (k_cache + 1).clone()
+    k_scale = torch.ones(4, 2, 1, dtype=torch.float32)
+    v_scale = torch.ones(4, 2, 1, dtype=torch.float32)
+    block_ids = torch.tensor([3, 1], dtype=torch.int64)
+
+    k_fp, v_fp = materialize_quantized_blocks(
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        block_ids,
+        torch.float32,
+        "int8",
+    )
+
+    assert torch.allclose(k_fp[0], k_cache[3].float())
+    assert torch.allclose(k_fp[1], k_cache[1].float())
+    assert torch.allclose(v_fp[0], v_cache[3].float())
+    assert torch.allclose(v_fp[1], v_cache[1].float())

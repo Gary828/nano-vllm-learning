@@ -31,6 +31,49 @@ def kv_cache_quant_uses_scale(mode) -> bool:
     return normalize_kv_cache_quant_dtype(mode) == "int8"
 
 
+def build_local_block_tables(block_tables: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    valid_mask = block_tables >= 0
+    local_block_tables = torch.full_like(block_tables, -1)
+    if not torch.any(valid_mask):
+        empty = torch.empty(0, dtype=torch.int64, device=block_tables.device)
+        return valid_mask, empty, local_block_tables
+    used_blocks = block_tables[valid_mask].to(torch.int64)
+    unique_blocks, inverse = torch.unique(used_blocks, sorted=True, return_inverse=True)
+    local_block_tables[valid_mask] = inverse.to(block_tables.dtype)
+    return valid_mask, unique_blocks, local_block_tables
+
+
+def materialize_quantized_blocks(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+    block_ids: torch.Tensor,
+    out_dtype: torch.dtype,
+    quant_dtype: str = "int8",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    quant_dtype = normalize_kv_cache_quant_dtype(quant_dtype)
+    if block_ids.numel() == 0:
+        empty = torch.empty(0, *k_cache.shape[1:], dtype=out_dtype, device=k_cache.device)
+        return empty, empty.clone()
+    if quant_dtype == "int8":
+        k_fp32 = torch.index_select(k_cache, 0, block_ids).to(torch.float32)
+        v_fp32 = torch.index_select(v_cache, 0, block_ids).to(torch.float32)
+        assert k_scale is not None and v_scale is not None
+        k_scale_used = torch.index_select(k_scale, 0, block_ids)
+        v_scale_used = torch.index_select(v_scale, 0, block_ids)
+        k_fp32.mul_(k_scale_used.unsqueeze(-1))
+        v_fp32.mul_(v_scale_used.unsqueeze(-1))
+        k_fp = k_fp32.to(out_dtype).contiguous()
+        v_fp = v_fp32.to(out_dtype).contiguous()
+        return k_fp, v_fp
+
+    # CUDA kernels for float8 do not implement index_select, so cast first.
+    k_fp = torch.index_select(k_cache.to(out_dtype), 0, block_ids).contiguous()
+    v_fp = torch.index_select(v_cache.to(out_dtype), 0, block_ids).contiguous()
+    return k_fp, v_fp
+
+
 def estimate_quantized_block_bytes(
     num_hidden_layers: int,
     block_size: int,
@@ -135,28 +178,18 @@ def materialize_paged_kvcache(
     out_dtype: torch.dtype,
     quant_dtype: str = "int8",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    quant_dtype = normalize_kv_cache_quant_dtype(quant_dtype)
-    valid_mask = block_tables >= 0
-    if not torch.any(valid_mask):
+    _, unique_blocks, local_block_tables = build_local_block_tables(block_tables)
+    if unique_blocks.numel() == 0:
         empty = torch.empty(0, *k_cache.shape[1:], dtype=out_dtype, device=k_cache.device)
         return empty, empty.clone(), block_tables
 
-    used_blocks = block_tables[valid_mask].to(torch.int64)
-    unique_blocks, inverse = torch.unique(used_blocks, sorted=True, return_inverse=True)
-
-    if quant_dtype == "int8":
-        k_quant = torch.index_select(k_cache, 0, unique_blocks)
-        v_quant = torch.index_select(v_cache, 0, unique_blocks)
-        assert k_scale is not None and v_scale is not None
-        k_scale_used = torch.index_select(k_scale, 0, unique_blocks)
-        v_scale_used = torch.index_select(v_scale, 0, unique_blocks)
-        k_fp = (k_quant.to(torch.float32) * k_scale_used.unsqueeze(-1)).to(out_dtype).contiguous()
-        v_fp = (v_quant.to(torch.float32) * v_scale_used.unsqueeze(-1)).to(out_dtype).contiguous()
-    else:
-        # CUDA kernels for float8 do not implement index_select, so cast first.
-        k_fp = torch.index_select(k_cache.to(out_dtype), 0, unique_blocks).contiguous()
-        v_fp = torch.index_select(v_cache.to(out_dtype), 0, unique_blocks).contiguous()
-
-    local_block_tables = torch.full_like(block_tables, -1)
-    local_block_tables[valid_mask] = inverse.to(block_tables.dtype)
+    k_fp, v_fp = materialize_quantized_blocks(
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        unique_blocks,
+        out_dtype,
+        quant_dtype,
+    )
     return k_fp, v_fp, local_block_tables

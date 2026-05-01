@@ -34,12 +34,13 @@ def run_case(
     kv_cache_quant,
     max_model_len: int,
     max_num_batched_tokens: int,
+    enforce_eager: bool,
 ):
     quant_mode = normalize_kv_cache_quant_dtype(kv_cache_quant)
     torch.cuda.empty_cache()
     llm = LLM(
         model_path,
-        enforce_eager=False,
+        enforce_eager=enforce_eager,
         kv_cache_quant=quant_mode,
         max_model_len=max_model_len,
         max_num_batched_tokens=max_num_batched_tokens,
@@ -121,6 +122,12 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--enforce-eager",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run all modes with eager execution for stable cross-mode comparison.",
+    )
+    parser.add_argument(
         "--kv-cache-dtypes",
         default="baseline,int8,fp8_e4m3fn",
         help="Comma-separated modes to benchmark. Supported: baseline,int8,fp8_e4m3fn,fp8_e5m2",
@@ -133,7 +140,7 @@ def main():
 
     prompts = make_low_overlap_prompts(args.num_requests, args.prompt_len, args.seed)
     max_model_len = args.prompt_len + args.max_tokens + 16
-    max_num_batched_tokens = args.num_requests * max(args.prompt_len, 1)
+    max_num_batched_tokens = max(args.num_requests * max(args.prompt_len, 1), max_model_len)
     modes = []
     for item in args.kv_cache_dtypes.split(","):
         item = item.strip().lower()
@@ -143,7 +150,15 @@ def main():
             modes.append(item)
 
     results = [
-        run_case(args.model_path, prompts, args.max_tokens, mode, max_model_len, max_num_batched_tokens)
+        run_case(
+            args.model_path,
+            prompts,
+            args.max_tokens,
+            mode,
+            max_model_len,
+            max_num_batched_tokens,
+            args.enforce_eager,
+        )
         for mode in modes
     ]
     print_summary(results, args.prompt_len, args.max_tokens)

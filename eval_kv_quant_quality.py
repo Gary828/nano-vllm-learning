@@ -30,14 +30,20 @@ def load_prompts() -> list[str]:
     return prompts
 
 
-def run_generation(model_path: str, prompts: list[str], kv_cache_quant, max_tokens: int):
+def run_generation(
+    model_path: str,
+    prompts: list[str],
+    kv_cache_quant,
+    max_tokens: int,
+    enforce_eager: bool,
+):
     torch.manual_seed(0)
     torch.cuda.empty_cache()
     quant_mode = normalize_kv_cache_quant_dtype(kv_cache_quant)
     llm = LLM(
         model_path,
         kv_cache_quant=quant_mode,
-        enforce_eager=False,
+        enforce_eager=enforce_eager,
         max_model_len=32768,
         max_num_batched_tokens=32768,
         max_num_seqs=len(prompts),
@@ -73,6 +79,12 @@ def main():
     parser.add_argument("--model-path", default="/root/study/lite_llama/my_weight/qwen3-0.6B")
     parser.add_argument("--max-tokens", type=int, default=24)
     parser.add_argument("--quant-mode", default="int8", help="int8, fp8_e4m3fn, or fp8_e5m2")
+    parser.add_argument(
+        "--enforce-eager",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run quality checks with eager execution for deterministic behavior across modes.",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.model_path):
@@ -80,8 +92,8 @@ def main():
         return
 
     prompts = load_prompts()
-    base_outputs = run_generation(args.model_path, prompts, False, args.max_tokens)
-    quant_outputs = run_generation(args.model_path, prompts, args.quant_mode, args.max_tokens)
+    base_outputs = run_generation(args.model_path, prompts, False, args.max_tokens, args.enforce_eager)
+    quant_outputs = run_generation(args.model_path, prompts, args.quant_mode, args.max_tokens, args.enforce_eager)
     compare_outputs(base_outputs, quant_outputs)
 
 
