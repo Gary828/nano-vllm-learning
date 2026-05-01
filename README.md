@@ -8,7 +8,11 @@
 
 ## 特性
 
-- 当前支持：`Qwen3`、`MiniCPM`
+- 当前支持：`Qwen3`、`MiniCPM`、`Llama`
+- 已验证：
+  - `Qwen3-0.6B`
+  - `MiniCPM4.1`
+  - 本地 `Llama-3.2-1B-Instruct` 单请求端到端 smoke（2026-04-17）
 - 已集成能力：
   - Prefix cache
   - Cache-aware scheduling
@@ -44,6 +48,10 @@ prompts = ["Hello, Nano-vLLM."]
 result = llm.generate(prompts, sampling_params)
 print(result["outputs"][0]["text"])
 ```
+
+注意：
+
+- 当前 `SamplingParams.temperature` 必须大于 `1e-10`，也就是暂不支持 `temperature=0` 的 greedy 模式。
 
 可选的 KV cache quant 模式：
 
@@ -109,4 +117,4 @@ llm = LLM("/YOUR/MODEL/PATH", kv_cache_quant="fp8_e5m2")
 - [`docs/CONTEXTPILOT_INTEGRATION_REPORT.md`](docs/CONTEXTPILOT_INTEGRATION_REPORT.md)：早期集成失败与复盘
 - [`docs/kv_cache_quant_interview.md`](docs/kv_cache_quant_interview.md)：KV cache quant 设计与 benchmark 解读
 - [`docs/nanovllm_minicpm41_interview.md`](docs/nanovllm_minicpm41_interview.md)：MiniCPM 支持说明
-- [`docs/llama_main_qwen3_minicpm41_adaptation.md`](docs/pr88_llama_main_qwen3_minicpm41_adaptation.md)：模型支持演进分析
+- [`docs/llama_main_qwen3_minicpm41_adaptation.md`](docs/pr88_llama_main_qwen3_minicpm41_adaptation.md)：Qwen3 / Llama / MiniCPM4.1 模型支持演进分析
