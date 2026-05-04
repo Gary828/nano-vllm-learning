@@ -58,6 +58,7 @@ class Attention(nn.Module):
         self.kv_cache_quant = None
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale = self.v_scale = torch.tensor([])
+        self._kvq_workspace = {}
         self._cached_block_tables = None
         self._cached_materialized = None
 
@@ -72,6 +73,7 @@ class Attention(nn.Module):
                 self.v_scale if self.v_scale.numel() else None,
                 slot_mapping,
                 self.kv_cache_quant,
+                workspace=self._kvq_workspace,
             )
         else:
             store_kvcache(k, v, self.k_cache, self.v_cache, slot_mapping)
