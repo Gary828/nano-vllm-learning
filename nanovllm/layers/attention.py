@@ -4,7 +4,11 @@ import triton
 import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from nanovllm.layers.kv_quant import materialize_paged_kvcache, store_kvcache_quantized
+from nanovllm.layers.kv_quant import (
+    materialize_paged_kvcache,
+    materialize_quantized_blocks,
+    store_kvcache_quantized,
+)
 from nanovllm.utils.context import get_context
 
 
@@ -60,6 +64,12 @@ class Attention(nn.Module):
         self.k_scale = self.v_scale = torch.tensor([])
         self._kvq_workspace = {}
         self._cached_block_tables = None
+        self._cached_unique_blocks = None
+        self._cached_materialized = None
+
+    def _invalidate_materialized_cache(self):
+        self._cached_block_tables = None
+        self._cached_unique_blocks = None
         self._cached_materialized = None
 
     def _store_paged_kv_cache(self, k: torch.Tensor, v: torch.Tensor, slot_mapping: torch.Tensor):
@@ -77,17 +87,31 @@ class Attention(nn.Module):
             )
         else:
             store_kvcache(k, v, self.k_cache, self.v_cache, slot_mapping)
+        # Conservative invalidation keeps decode correctness: each decode step updates
+        # cache contents, so previously materialized tensors are stale.
+        self._invalidate_materialized_cache()
 
     def _materialize_cached_kv(self, block_tables: torch.Tensor, out_dtype: torch.dtype):
-        if self.kv_cache_quant and (not getattr(get_context(), "is_prefill", False)):
-            if (
-                self._cached_block_tables is not None
-                and self._cached_materialized is not None
-                and self._cached_block_tables.shape == block_tables.shape
-                and torch.equal(self._cached_block_tables, block_tables)
-            ):
-                return self._cached_materialized
+        context = get_context()
         if self.kv_cache_quant:
+            if not context.is_prefill and context.unique_blocks is not None and context.local_block_tables is not None:
+                unique_blocks = context.unique_blocks
+                local_block_tables = context.local_block_tables
+                if unique_blocks.numel() == 0:
+                    empty = torch.empty(0, *self.k_cache.shape[1:], dtype=out_dtype, device=self.k_cache.device)
+                    self._invalidate_materialized_cache()
+                    return empty, empty.clone(), local_block_tables
+                k_fp, v_fp = materialize_quantized_blocks(
+                    self.k_cache,
+                    self.v_cache,
+                    self.k_scale if self.k_scale.numel() else None,
+                    self.v_scale if self.v_scale.numel() else None,
+                    unique_blocks,
+                    out_dtype,
+                    self.kv_cache_quant,
+                )
+                self._invalidate_materialized_cache()
+                return k_fp, v_fp, local_block_tables
             materialized = materialize_paged_kvcache(
                 self.k_cache,
                 self.v_cache,
@@ -97,15 +121,9 @@ class Attention(nn.Module):
                 out_dtype,
                 self.kv_cache_quant,
             )
-            if not getattr(get_context(), "is_prefill", False):
-                self._cached_block_tables = block_tables.clone()
-                self._cached_materialized = materialized
-            else:
-                self._cached_block_tables = None
-                self._cached_materialized = None
+            self._invalidate_materialized_cache()
             return materialized
-        self._cached_block_tables = None
-        self._cached_materialized = None
+        self._invalidate_materialized_cache()
         return self.k_cache, self.v_cache, block_tables
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):

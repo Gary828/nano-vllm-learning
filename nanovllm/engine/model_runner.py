@@ -8,6 +8,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.kv_quant import (
+    build_local_block_tables,
     estimate_quantized_block_bytes,
     get_kv_cache_storage_dtype,
     kv_cache_quant_uses_scale,
@@ -244,7 +245,17 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        local_block_tables, unique_blocks = None, None
+        if self.config.kv_cache_quant:
+            _, unique_blocks, local_block_tables = build_local_block_tables(block_tables)
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            local_block_tables=local_block_tables,
+            unique_blocks=unique_blocks,
+        )
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
