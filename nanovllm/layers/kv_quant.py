@@ -86,7 +86,6 @@ def quantize_store_int8_kernel(
     scale_ptr,
     scale_stride_row,
     scale_stride_head,
-    num_rows,
     head_dim,
     BLOCK_D: tl.constexpr,
 ):
@@ -94,7 +93,10 @@ def quantize_store_int8_kernel(
     head = tl.program_id(axis=1)
     offs_d = tl.arange(0, BLOCK_D)
     d_mask = offs_d < head_dim
-    row_mask = row < num_rows
+
+    slot = tl.load(slots_ptr + row)
+    if slot < 0:
+        return
 
     x_ptrs = (
         in_ptr
@@ -102,25 +104,24 @@ def quantize_store_int8_kernel(
         + head * in_stride_head
         + offs_d * in_stride_dim
     )
-    x = tl.load(x_ptrs, mask=row_mask & d_mask, other=0.0).to(tl.float32)
+    x = tl.load(x_ptrs, mask=d_mask, other=0.0).to(tl.float32)
     abs_x = tl.abs(x)
     max_abs = tl.max(abs_x, axis=0)
     scale = tl.maximum(max_abs / 127.0, 1e-8)
-    q = x / scale
+    inv_scale = 1.0 / scale
+    q = x * inv_scale
     q = tl.maximum(tl.minimum(q, 127.0), -127.0)
     q = tl.extra.cuda.libdevice.rint(q).to(tl.int8)
 
-    slot = tl.load(slots_ptr + row, mask=row_mask, other=-1)
-    slot_mask = row_mask & (slot >= 0)
     cache_ptrs = (
         cache_ptr
         + slot * cache_stride_row
         + head * cache_stride_head
         + offs_d * cache_stride_dim
     )
-    tl.store(cache_ptrs, q, mask=slot_mask & d_mask)
+    tl.store(cache_ptrs, q, mask=d_mask)
     scale_loc = scale_ptr + slot * scale_stride_row + head * scale_stride_head
-    tl.store(scale_loc, scale, mask=slot_mask)
+    tl.store(scale_loc, scale)
 
 
 @triton.autotune(
@@ -158,7 +159,6 @@ def quantize_store_int8_pair_kernel(
     v_scale_ptr,
     v_scale_stride_row,
     v_scale_stride_head,
-    num_rows,
     head_dim,
     block_size_tokens,
     BLOCK_D: tl.constexpr,
@@ -167,7 +167,10 @@ def quantize_store_int8_pair_kernel(
     head = tl.program_id(axis=1)
     offs_d = tl.arange(0, BLOCK_D)
     d_mask = offs_d < head_dim
-    row_mask = row < num_rows
+
+    slot = tl.load(slots_ptr + row)
+    if slot < 0:
+        return
 
     k_ptrs = (
         k_in_ptr
@@ -181,23 +184,23 @@ def quantize_store_int8_pair_kernel(
         + head * v_in_stride_head
         + offs_d * v_in_stride_dim
     )
-    kx = tl.load(k_ptrs, mask=row_mask & d_mask, other=0.0).to(tl.float32)
-    vx = tl.load(v_ptrs, mask=row_mask & d_mask, other=0.0).to(tl.float32)
+    kx = tl.load(k_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+    vx = tl.load(v_ptrs, mask=d_mask, other=0.0).to(tl.float32)
 
     k_abs = tl.abs(kx)
     v_abs = tl.abs(vx)
     k_scale = tl.maximum(tl.max(k_abs, axis=0) / 127.0, 1e-8)
     v_scale = tl.maximum(tl.max(v_abs, axis=0) / 127.0, 1e-8)
+    k_inv_scale = 1.0 / k_scale
+    v_inv_scale = 1.0 / v_scale
 
-    kq = kx / k_scale
-    vq = vx / v_scale
+    kq = kx * k_inv_scale
+    vq = vx * v_inv_scale
     kq = tl.maximum(tl.minimum(kq, 127.0), -127.0)
     vq = tl.maximum(tl.minimum(vq, 127.0), -127.0)
     kq = tl.extra.cuda.libdevice.rint(kq).to(tl.int8)
     vq = tl.extra.cuda.libdevice.rint(vq).to(tl.int8)
 
-    slot = tl.load(slots_ptr + row, mask=row_mask, other=-1)
-    slot_mask = row_mask & (slot >= 0)
     k_cache_ptrs = (
         k_cache_ptr
         + slot * k_cache_stride_row
@@ -210,13 +213,13 @@ def quantize_store_int8_pair_kernel(
         + head * v_cache_stride_head
         + offs_d * v_cache_stride_dim
     )
-    tl.store(k_cache_ptrs, kq, mask=slot_mask & d_mask)
-    tl.store(v_cache_ptrs, vq, mask=slot_mask & d_mask)
+    tl.store(k_cache_ptrs, kq, mask=d_mask)
+    tl.store(v_cache_ptrs, vq, mask=d_mask)
 
     k_scale_loc = k_scale_ptr + slot * k_scale_stride_row + head * k_scale_stride_head
     v_scale_loc = v_scale_ptr + slot * v_scale_stride_row + head * v_scale_stride_head
-    tl.store(k_scale_loc, k_scale, mask=slot_mask)
-    tl.store(v_scale_loc, v_scale, mask=slot_mask)
+    tl.store(k_scale_loc, k_scale)
+    tl.store(v_scale_loc, v_scale)
 
 
 def _next_power_of_2(n: int) -> int:
@@ -319,7 +322,6 @@ def _quantize_store_int8_fused(
         scale_2d,
         scale_2d.stride(0),
         scale_2d.stride(1),
-        n,
         head_dim,
         BLOCK_D=block_d,
     )
@@ -419,7 +421,6 @@ def _quantize_store_int8_pair_fused(
         flat_v_scale,
         flat_v_scale.stride(0),
         flat_v_scale.stride(1),
-        n,
         head_dim,
         int(k_cache.size(1)),
     )
@@ -515,7 +516,7 @@ def store_kvcache_int8(
 ):
     if slot_mapping.numel() == 0:
         return
-    slots = slot_mapping.contiguous()
+    slots = slot_mapping if slot_mapping.is_contiguous() else slot_mapping.contiguous()
     key_valid = key
     value_valid = value
     if slots.dtype == torch.int64:
@@ -533,20 +534,21 @@ def store_kvcache_int8(
             slots_i32.copy_(slots.to(torch.int32))
             slots = slots_i32
 
-    flat_k_cache = k_cache.view(-1, k_cache.size(-2), k_cache.size(-1))
-    flat_v_cache = v_cache.view(-1, v_cache.size(-2), v_cache.size(-1))
-    flat_k_scale = k_scale.view(-1, k_scale.size(-1))
-    flat_v_scale = v_scale.view(-1, v_scale.size(-1))
     if _quantize_store_int8_pair_fused(
         key_valid,
         value_valid,
         slots,
-        flat_k_cache,
-        flat_v_cache,
-        flat_k_scale,
-        flat_v_scale,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
     ):
         return
+
+    flat_k_cache = k_cache.view(-1, k_cache.size(-2), k_cache.size(-1))
+    flat_v_cache = v_cache.view(-1, v_cache.size(-2), v_cache.size(-1))
+    flat_k_scale = k_scale.view(-1, k_scale.size(-1))
+    flat_v_scale = v_scale.view(-1, v_scale.size(-1))
 
     valid = slot_mapping != -1
     if not torch.any(valid):
