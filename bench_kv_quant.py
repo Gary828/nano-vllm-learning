@@ -2,6 +2,7 @@ import argparse
 import math
 import os
 import time
+from contextlib import AbstractContextManager
 from random import randint, seed
 
 import torch
@@ -27,6 +28,81 @@ def make_sampling_params(num_requests: int, max_tokens: int) -> list[SamplingPar
     ]
 
 
+class KvPathProfiler(AbstractContextManager):
+
+    TARGETS = (
+        "store_kvcache_int8",
+        "_quantize_store_int8_pair_fused",
+        "_gather_dequant_int8_fused",
+        "store_kvcache_fp8",
+        "_store_fp8_pair_fused",
+        "_gather_cast_fp8_fused",
+        "materialize_quantized_blocks",
+        "build_local_block_tables",
+    )
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self._module = None
+        self._orig: dict[str, object] = {}
+        self._stats: dict[str, dict[str, float | int]] = {}
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        import nanovllm.layers.kv_quant as kvq
+
+        self._module = kvq
+        for name in self.TARGETS:
+            if not hasattr(kvq, name):
+                continue
+            fn = getattr(kvq, name)
+            if not callable(fn):
+                continue
+            self._orig[name] = fn
+
+            def _wrap(fn_name, fn_impl):
+                def _wrapped(*args, **kwargs):
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    out = fn_impl(*args, **kwargs)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    dt = time.perf_counter() - t0
+                    row = self._stats.setdefault(fn_name, {"calls": 0, "total_s": 0.0})
+                    row["calls"] = int(row["calls"]) + 1
+                    row["total_s"] = float(row["total_s"]) + dt
+                    return out
+
+                return _wrapped
+
+            setattr(kvq, name, _wrap(name, fn))
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._module is not None:
+            for name, fn in self._orig.items():
+                setattr(self._module, name, fn)
+        return False
+
+    def summary(self) -> list[dict]:
+        rows = []
+        for name, s in self._stats.items():
+            calls = int(s["calls"])
+            total_s = float(s["total_s"])
+            rows.append(
+                {
+                    "name": name,
+                    "calls": calls,
+                    "total_s": total_s,
+                    "avg_ms": (total_s / calls * 1000.0) if calls else 0.0,
+                }
+            )
+        rows.sort(key=lambda x: x["total_s"], reverse=True)
+        return rows
+
+
 def run_case(
     model_path: str,
     prompts: list[list[int]],
@@ -35,6 +111,7 @@ def run_case(
     max_model_len: int,
     max_num_batched_tokens: int,
     enforce_eager: bool,
+    profile_kv_path: bool = False,
 ):
     quant_mode = normalize_kv_cache_quant_dtype(kv_cache_quant)
     torch.cuda.empty_cache()
@@ -51,9 +128,10 @@ def run_case(
     init_reserved = torch.cuda.memory_reserved()
     torch.cuda.reset_peak_memory_stats()
 
-    t0 = time.perf_counter()
-    result = llm.generate(prompts, sampling_params, use_tqdm=False, use_context_optimizer=False)
-    elapsed = time.perf_counter() - t0
+    with KvPathProfiler(profile_kv_path) as kv_profiler:
+        t0 = time.perf_counter()
+        result = llm.generate(prompts, sampling_params, use_tqdm=False, use_context_optimizer=False)
+        elapsed = time.perf_counter() - t0
     generate_peak_allocated = torch.cuda.max_memory_allocated()
     generate_peak_reserved = torch.cuda.max_memory_reserved()
 
@@ -76,6 +154,7 @@ def run_case(
         "num_kvcache_blocks": num_blocks,
         "est_max_live_seqs": est_max_live_seqs,
         "total_output_tokens": total_output_tokens,
+        "kv_profile": kv_profiler.summary() if profile_kv_path else [],
     }
     del llm
     torch.cuda.empty_cache()
@@ -103,6 +182,13 @@ def print_summary(results: list[dict], prompt_len: int, max_tokens: int):
             f"{row['num_kvcache_blocks']:>9} | "
             f"{row['est_max_live_seqs']:>18}"
         )
+        if row.get("kv_profile"):
+            print("  kv-profile:")
+            for p in row["kv_profile"]:
+                print(
+                    f"    {p['name']}: calls={p['calls']}, "
+                    f"total={p['total_s']:.3f}s, avg={p['avg_ms']:.3f}ms"
+                )
 
     base = results[0]
     print()
@@ -132,6 +218,12 @@ def main():
         default="baseline,int8,fp8_e4m3fn",
         help="Comma-separated modes to benchmark. Supported: baseline,int8,fp8_e4m3fn,fp8_e5m2",
     )
+    parser.add_argument(
+        "--profile-kv-path",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Collect lightweight per-function timing for kv quant path.",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.model_path):
@@ -158,6 +250,7 @@ def main():
             max_model_len,
             max_num_batched_tokens,
             args.enforce_eager,
+            args.profile_kv_path,
         )
         for mode in modes
     ]
