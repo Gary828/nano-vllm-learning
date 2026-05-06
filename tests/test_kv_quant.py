@@ -204,3 +204,31 @@ def test_materialize_quantized_blocks_int8_bfloat16_output():
     expected_v = torch.index_select(v_cache, 0, block_ids).float() * 0.25
     assert torch.allclose(k_fp.float(), expected_k, atol=1e-3)
     assert torch.allclose(v_fp.float(), expected_v, atol=1e-3)
+
+
+def test_materialize_quantized_blocks_fp8_subset():
+    k_cache = torch.tensor(
+        [
+            [[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]],
+            [[[9.0, 10.0], [11.0, 12.0]], [[13.0, 14.0], [15.0, 16.0]]],
+            [[[17.0, 18.0], [19.0, 20.0]], [[21.0, 22.0], [23.0, 24.0]]],
+        ],
+        dtype=torch.float32,
+    ).to(torch.float8_e4m3fn)
+    v_cache = (k_cache.float() * 0.5).to(torch.float8_e4m3fn)
+    block_ids = torch.tensor([2, 0], dtype=torch.int64)
+
+    k_fp, v_fp = materialize_quantized_blocks(
+        k_cache,
+        v_cache,
+        None,
+        None,
+        block_ids,
+        torch.float32,
+        "fp8_e4m3fn",
+    )
+
+    expected_k = torch.index_select(k_cache.float(), 0, block_ids)
+    expected_v = torch.index_select(v_cache.float(), 0, block_ids)
+    assert torch.allclose(k_fp.float(), expected_k, atol=1e-2)
+    assert torch.allclose(v_fp.float(), expected_v, atol=1e-2)

@@ -8,6 +8,7 @@ KV_CACHE_QUANT_DTYPES = {
     "fp8_e4m3fn": torch.float8_e4m3fn,
     "fp8_e5m2": torch.float8_e5m2,
 }
+FP8_CACHE_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 def normalize_kv_cache_quant_dtype(mode) -> str | None:
@@ -70,6 +71,38 @@ def gather_dequant_int8_kernel(
     out = q * scale
     out_ptrs = out_ptr + row * out_stride_row + head * out_stride_head + offs_d * out_stride_dim
     tl.store(out_ptrs, out, mask=d_mask)
+
+
+@triton.jit
+def gather_cast_fp8_kernel(
+    cache_ptr,
+    block_ids_ptr,
+    out_ptr,
+    head_dim,
+    block_size,
+    cache_stride_row,
+    cache_stride_head,
+    cache_stride_dim,
+    out_stride_row,
+    out_stride_head,
+    out_stride_dim,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(axis=0)
+    head = tl.program_id(axis=1)
+    chunk = tl.program_id(axis=2)
+    offs_d = chunk * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = offs_d < head_dim
+
+    block_pos = row // block_size
+    token_pos = row - block_pos * block_size
+    src_block = tl.load(block_ids_ptr + block_pos)
+    src_row = src_block * block_size + token_pos
+
+    cache_ptrs = cache_ptr + src_row * cache_stride_row + head * cache_stride_head + offs_d * cache_stride_dim
+    x = tl.load(cache_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+    out_ptrs = out_ptr + row * out_stride_row + head * out_stride_head + offs_d * out_stride_dim
+    tl.store(out_ptrs, x, mask=d_mask)
 
 
 @triton.jit
@@ -222,6 +255,79 @@ def quantize_store_int8_pair_kernel(
     tl.store(v_scale_loc, v_scale)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_D": 64}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_D": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=2),
+    ],
+    key=["head_dim", "block_size_tokens"],
+)
+@triton.jit
+def store_fp8_pair_kernel(
+    k_in_ptr,
+    k_in_stride_row,
+    k_in_stride_head,
+    k_in_stride_dim,
+    v_in_ptr,
+    v_in_stride_row,
+    v_in_stride_head,
+    v_in_stride_dim,
+    slots_ptr,
+    k_cache_ptr,
+    k_cache_stride_row,
+    k_cache_stride_head,
+    k_cache_stride_dim,
+    v_cache_ptr,
+    v_cache_stride_row,
+    v_cache_stride_head,
+    v_cache_stride_dim,
+    head_dim,
+    block_size_tokens,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(axis=0)
+    head = tl.program_id(axis=1)
+    offs_d = tl.arange(0, BLOCK_D)
+    d_mask = offs_d < head_dim
+
+    slot = tl.load(slots_ptr + row)
+    if slot < 0:
+        return
+
+    k_ptrs = (
+        k_in_ptr
+        + row * k_in_stride_row
+        + head * k_in_stride_head
+        + offs_d * k_in_stride_dim
+    )
+    v_ptrs = (
+        v_in_ptr
+        + row * v_in_stride_row
+        + head * v_in_stride_head
+        + offs_d * v_in_stride_dim
+    )
+    kx = tl.load(k_ptrs, mask=d_mask, other=0.0)
+    vx = tl.load(v_ptrs, mask=d_mask, other=0.0)
+
+    k_cache_ptrs = (
+        k_cache_ptr
+        + slot * k_cache_stride_row
+        + head * k_cache_stride_head
+        + offs_d * k_cache_stride_dim
+    )
+    v_cache_ptrs = (
+        v_cache_ptr
+        + slot * v_cache_stride_row
+        + head * v_cache_stride_head
+        + offs_d * v_cache_stride_dim
+    )
+    tl.store(k_cache_ptrs, kx, mask=d_mask)
+    tl.store(v_cache_ptrs, vx, mask=d_mask)
+
+
 def _next_power_of_2(n: int) -> int:
     if n <= 1:
         return 1
@@ -279,6 +385,53 @@ def _gather_dequant_int8_fused(
     return out
 
 
+def _gather_cast_fp8_fused(
+    cache: torch.Tensor,
+    block_ids: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if not cache.is_cuda or not block_ids.is_cuda:
+        return None
+    if not cache.is_contiguous() or not block_ids.is_contiguous():
+        return None
+    if cache.dtype not in FP8_CACHE_DTYPES:
+        return None
+    if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return None
+
+    num_selected = int(block_ids.numel())
+    block_size = int(cache.size(1))
+    num_heads = int(cache.size(2))
+    head_dim = int(cache.size(3))
+    out = torch.empty((num_selected, block_size, num_heads, head_dim), dtype=out_dtype, device=cache.device)
+    if num_selected == 0:
+        return out
+
+    rows = num_selected * block_size
+    block_d = min(256, _next_power_of_2(head_dim))
+    grid = (rows, num_heads, triton.cdiv(head_dim, block_d))
+    cache_3d = cache.view(-1, num_heads, head_dim)
+    out_3d = out.view(rows, num_heads, head_dim)
+    try:
+        gather_cast_fp8_kernel[grid](
+            cache_3d,
+            block_ids,
+            out_3d,
+            head_dim,
+            block_size,
+            cache_3d.stride(0),
+            cache_3d.stride(1),
+            cache_3d.stride(2),
+            out_3d.stride(0),
+            out_3d.stride(1),
+            out_3d.stride(2),
+            BLOCK_D=block_d,
+        )
+    except Exception:
+        return None
+    return out
+
+
 def _quantize_store_int8_fused(
     x: torch.Tensor,
     slots: torch.Tensor,
@@ -325,6 +478,75 @@ def _quantize_store_int8_fused(
         head_dim,
         BLOCK_D=block_d,
     )
+    return True
+
+
+def _store_fp8_pair_fused(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    slots: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+) -> bool:
+    if (
+        not key.is_cuda
+        or not value.is_cuda
+        or not slots.is_cuda
+        or not k_cache.is_cuda
+        or not v_cache.is_cuda
+    ):
+        return False
+    if (
+        key.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or value.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or slots.dtype not in (torch.int32, torch.int64)
+        or k_cache.dtype not in FP8_CACHE_DTYPES
+        or v_cache.dtype not in FP8_CACHE_DTYPES
+    ):
+        return False
+    if key.shape != value.shape or key.dim() != 3:
+        return False
+    if slots.dim() != 1 or slots.numel() != key.size(0):
+        return False
+
+    if not key.is_contiguous():
+        key = key.contiguous()
+    if not value.is_contiguous():
+        value = value.contiguous()
+    if not slots.is_contiguous():
+        slots = slots.contiguous()
+
+    n, num_heads, head_dim = key.shape
+    if n == 0:
+        return True
+
+    flat_k_cache = k_cache.view(-1, k_cache.size(-2), k_cache.size(-1))
+    flat_v_cache = v_cache.view(-1, v_cache.size(-2), v_cache.size(-1))
+    grid = (n, num_heads)
+    try:
+        store_fp8_pair_kernel[grid](
+            key,
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            value,
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            slots,
+            flat_k_cache,
+            flat_k_cache.stride(0),
+            flat_k_cache.stride(1),
+            flat_k_cache.stride(2),
+            flat_v_cache,
+            flat_v_cache.stride(0),
+            flat_v_cache.stride(1),
+            flat_v_cache.stride(2),
+            head_dim,
+            int(k_cache.size(1)),
+        )
+    except Exception:
+        return False
     return True
 
 
@@ -468,6 +690,10 @@ def materialize_quantized_blocks(
         v_fp = v_fp32.to(out_dtype).contiguous()
         return k_fp, v_fp
 
+    k_fp = _gather_cast_fp8_fused(k_cache, block_ids, out_dtype)
+    v_fp = _gather_cast_fp8_fused(v_cache, block_ids, out_dtype)
+    if k_fp is not None and v_fp is not None:
+        return k_fp.contiguous(), v_fp.contiguous()
     # CUDA kernels for float8 do not implement index_select, so cast first.
     k_fp = torch.index_select(k_cache.to(out_dtype), 0, block_ids).contiguous()
     v_fp = torch.index_select(v_cache.to(out_dtype), 0, block_ids).contiguous()
@@ -607,16 +833,79 @@ def store_kvcache_fp8(
     quant_dtype: str,
     workspace: dict | None = None,
 ):
+    if slot_mapping.numel() == 0:
+        return
+    slots = slot_mapping if slot_mapping.is_contiguous() else slot_mapping.contiguous()
+    if slots.dtype == torch.int64:
+        if workspace is None:
+            slots = slots.to(torch.int32)
+        else:
+            slots_i32 = _workspace_view(workspace, "slots_i32_cast_fp8", tuple(slots.shape), torch.int32, slots.device)
+            slots_i32.copy_(slots)
+            slots = slots_i32
+    elif slots.dtype != torch.int32:
+        if workspace is None:
+            slots = slots.to(torch.int32)
+        else:
+            slots_i32 = _workspace_view(
+                workspace,
+                "slots_i32_cast_fp8",
+                tuple(slots.shape),
+                torch.int32,
+                slots.device,
+            )
+            slots_i32.copy_(slots.to(torch.int32))
+            slots = slots_i32
+
+    if _store_fp8_pair_fused(key, value, slots, k_cache, v_cache):
+        return
+
     valid = slot_mapping != -1
     if not torch.any(valid):
         return
-    slots = slot_mapping[valid].to(torch.int64)
     cache_dtype = get_kv_cache_storage_dtype(quant_dtype)
     flat_k_cache = k_cache.view(-1, k_cache.size(-2), k_cache.size(-1))
     flat_v_cache = v_cache.view(-1, v_cache.size(-2), v_cache.size(-1))
-    key_fp8 = key[valid].to(cache_dtype)
-    value_fp8 = value[valid].to(cache_dtype)
-    for idx, slot in enumerate(slots.tolist()):
+    if bool(torch.all(valid)):
+        slots_l = slot_mapping.to(torch.int64)
+        key_valid = key
+        value_valid = value
+    else:
+        valid_idx = torch.nonzero(valid, as_tuple=False).flatten()
+        if workspace is None:
+            slots_l = torch.index_select(slot_mapping, 0, valid_idx).to(torch.int64)
+            key_valid = torch.index_select(key, 0, valid_idx)
+            value_valid = torch.index_select(value, 0, valid_idx)
+        else:
+            n_valid = int(valid_idx.numel())
+            slots_tmp = _workspace_view(
+                workspace,
+                "slots_fallback_fp8",
+                (n_valid,),
+                slot_mapping.dtype,
+                slot_mapping.device,
+            )
+            key_valid = _workspace_view(
+                workspace,
+                "key_valid_fp8",
+                (n_valid, key.size(1), key.size(2)),
+                key.dtype,
+                key.device,
+            )
+            value_valid = _workspace_view(
+                workspace,
+                "value_valid_fp8",
+                (n_valid, value.size(1), value.size(2)),
+                value.dtype,
+                value.device,
+            )
+            torch.index_select(slot_mapping, 0, valid_idx, out=slots_tmp)
+            torch.index_select(key, 0, valid_idx, out=key_valid)
+            torch.index_select(value, 0, valid_idx, out=value_valid)
+            slots_l = slots_tmp.to(torch.int64)
+    key_fp8 = key_valid.to(cache_dtype)
+    value_fp8 = value_valid.to(cache_dtype)
+    for idx, slot in enumerate(slots_l.tolist()):
         flat_k_cache[slot].copy_(key_fp8[idx])
         flat_v_cache[slot].copy_(value_fp8[idx])
 
