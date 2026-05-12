@@ -8,6 +8,7 @@ from nanovllm.engine.block_manager import BlockManager
 class Scheduler:
 
     def __init__(self, config: Config):
+        self.max_model_len = getattr(config, "max_model_len", 1 << 30)
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos if isinstance(config.eos, set) else {config.eos}
@@ -20,6 +21,10 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        if len(seq) > self.max_model_len - 1:
+            raise ValueError(
+                f"Sequence length {len(seq)} exceeds max_model_len-1 ({self.max_model_len - 1})"
+            )
         self.waiting.append(seq)
 
     def _sort_waiting_by_prefix(self):
@@ -35,6 +40,30 @@ class Scheduler:
             return -1
         self.waiting = deque(sorted(self.waiting, key=prefix_key))
 
+    def _predict_prefill_new_tokens(self, seq: Sequence) -> int:
+        if self.cache_aware:
+            predicted_new = (
+                len(seq)
+                - self.block_manager.count_cached_blocks(seq) * self.block_manager.block_size
+            )
+            return max(predicted_new, 1)
+        return len(seq)
+
+    def _take_schedulable_waiting(self, num_batched_tokens: int) -> Sequence | None:
+        for i, seq in enumerate(self.waiting):
+            predicted_new = self._predict_prefill_new_tokens(seq)
+            if (
+                num_batched_tokens + predicted_new <= self.max_num_batched_tokens
+                and self.block_manager.can_allocate(seq)
+            ):
+                if i == 0:
+                    return self.waiting.popleft()
+                self.waiting.rotate(-i)
+                picked = self.waiting.popleft()
+                self.waiting.rotate(i)
+                return picked
+        return None
+
     def schedule(self) -> tuple[list[Sequence], bool]:
         if self.cache_aware and self.waiting:
             self._sort_waiting_by_prefix()
@@ -43,19 +72,13 @@ class Scheduler:
         num_seqs = 0
         num_batched_tokens = 0
         while self.waiting and num_seqs < self.max_num_seqs:
-            seq = self.waiting[0]
-            if self.cache_aware:
-                predicted_new = len(seq) - self.block_manager.count_cached_blocks(seq) * self.block_manager.block_size
-                predicted_new = max(predicted_new, 1)
-            else:
-                predicted_new = len(seq)
-            if num_batched_tokens + predicted_new > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
+            seq = self._take_schedulable_waiting(num_batched_tokens)
+            if seq is None:
                 break
             num_seqs += 1
             self.block_manager.allocate(seq)
             num_batched_tokens += len(seq) - seq.num_cached_tokens
             seq.status = SequenceStatus.RUNNING
-            self.waiting.popleft()
             self.running.append(seq)
             scheduled_seqs.append(seq)
         if scheduled_seqs:
@@ -74,7 +97,11 @@ class Scheduler:
                 num_seqs += 1
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
+        if not scheduled_seqs:
+            raise RuntimeError(
+                "No schedulable sequence: waiting requests exceed current token/cache budget. "
+                "Try increasing max_num_batched_tokens or KV cache capacity."
+            )
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
@@ -86,7 +113,11 @@ class Scheduler:
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id in self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            if (
+                (not seq.ignore_eos and token_id in self.eos)
+                or seq.num_completion_tokens == seq.max_tokens
+                or len(seq) >= self.max_model_len
+            ):
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)

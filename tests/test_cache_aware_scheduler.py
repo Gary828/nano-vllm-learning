@@ -173,3 +173,50 @@ class TestSortWaitingByPrefix:
         scheduler = self._make_scheduler()
         scheduler._sort_waiting_by_prefix()
         assert len(scheduler.waiting) == 0
+
+
+class TestSchedulerSafetyAndProgress:
+
+    def _make_scheduler(self, num_blocks=8, max_model_len=4096, max_num_batched_tokens=1024):
+        class FakeConfig:
+            pass
+
+        cfg = FakeConfig()
+        cfg.max_num_seqs = 32
+        cfg.eos = -1
+        cfg.num_kvcache_blocks = num_blocks
+        cfg.kvcache_block_size = 256
+        cfg.cache_aware = True
+        cfg.max_model_len = max_model_len
+        cfg.max_num_batched_tokens = max_num_batched_tokens
+        return Scheduler(cfg)
+
+    def _make_seq(self, token_ids):
+        return Sequence(token_ids, SamplingParams(temperature=0.6, max_tokens=1))
+
+    def test_add_rejects_too_long_prompt(self):
+        scheduler = self._make_scheduler(max_model_len=300)
+        seq = self._make_seq([1] * 300)
+        with pytest.raises(ValueError):
+            scheduler.add(seq)
+
+    def test_prefill_can_skip_blocked_head(self):
+        scheduler = self._make_scheduler(num_blocks=8, max_num_batched_tokens=1024)
+        # First seq exceeds token budget; second seq is schedulable.
+        long_seq = self._make_seq([1] * 1200)
+        short_seq = self._make_seq([2] * 300)
+        scheduler.add(long_seq)
+        scheduler.add(short_seq)
+
+        seqs, is_prefill = scheduler.schedule()
+        assert is_prefill is True
+        assert len(seqs) == 1
+        assert seqs[0] is short_seq
+        # blocked head remains waiting
+        assert scheduler.waiting[0] is long_seq
+
+    def test_schedule_raises_when_nothing_schedulable(self):
+        scheduler = self._make_scheduler(num_blocks=4, max_num_batched_tokens=128)
+        scheduler.add(self._make_seq([1] * 300))
+        with pytest.raises(RuntimeError):
+            scheduler.schedule()
