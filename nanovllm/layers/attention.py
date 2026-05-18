@@ -25,7 +25,8 @@ def store_kvcache_kernel(
 ):
     idx = tl.program_id(0)
     slot = tl.load(slot_mapping_ptr + idx)
-    if slot == -1: return
+    if slot == -1:
+        return
     key_offsets = idx * key_stride + tl.arange(0, D)
     value_offsets = idx * value_stride + tl.arange(0, D)
     key = tl.load(key_ptr + key_offsets)
@@ -35,25 +36,34 @@ def store_kvcache_kernel(
     tl.store(v_cache_ptr + cache_offsets, value)
 
 
-def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
-    N, num_heads, head_dim = key.shape
-    D = num_heads * head_dim
+def store_kvcache(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+):
+    n_tokens, num_heads, head_dim = key.shape
+    hidden_dim = num_heads * head_dim
     assert key.stride(-1) == 1 and value.stride(-1) == 1
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
-    assert k_cache.stride(1) == D and v_cache.stride(1) == D
-    assert slot_mapping.numel() == N
-    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
+    assert k_cache.stride(1) == hidden_dim and v_cache.stride(1) == hidden_dim
+    assert slot_mapping.numel() == n_tokens
+    store_kvcache_kernel[(n_tokens,)](
+        key,
+        key.stride(0),
+        value,
+        value.stride(0),
+        k_cache,
+        v_cache,
+        slot_mapping,
+        hidden_dim,
+    )
 
 
 class Attention(nn.Module):
 
-    def __init__(
-        self,
-        num_heads,
-        head_dim,
-        scale,
-        num_kv_heads,
-    ):
+    def __init__(self, num_heads, head_dim, scale, num_kv_heads):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -87,14 +97,16 @@ class Attention(nn.Module):
             )
         else:
             store_kvcache(k, v, self.k_cache, self.v_cache, slot_mapping)
-        # Conservative invalidation keeps decode correctness: each decode step updates
-        # cache contents, so previously materialized tensors are stale.
         self._invalidate_materialized_cache()
 
     def _materialize_cached_kv(self, block_tables: torch.Tensor, out_dtype: torch.dtype):
         context = get_context()
         if self.kv_cache_quant:
-            if not context.is_prefill and context.unique_blocks is not None and context.local_block_tables is not None:
+            if (
+                not context.is_prefill
+                and context.unique_blocks is not None
+                and context.local_block_tables is not None
+            ):
                 unique_blocks = context.unique_blocks
                 local_block_tables = context.local_block_tables
                 if unique_blocks.numel() == 0:
@@ -123,6 +135,7 @@ class Attention(nn.Module):
             )
             self._invalidate_materialized_cache()
             return materialized
+
         self._invalidate_materialized_cache()
         return self.k_cache, self.v_cache, block_tables
 
@@ -131,18 +144,33 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             self._store_paged_kv_cache(k, v, context.slot_mapping)
+
         if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
+            if context.block_tables is not None:
                 k, v, block_tables = self._materialize_cached_kv(context.block_tables, q.dtype)
             else:
                 block_tables = None
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=block_tables)
-        else:    # decode
+            o = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                max_seqlen_q=context.max_seqlen_q,
+                cu_seqlens_q=context.cu_seqlens_q,
+                max_seqlen_k=context.max_seqlen_k,
+                cu_seqlens_k=context.cu_seqlens_k,
+                softmax_scale=self.scale,
+                causal=True,
+                block_table=block_tables,
+            )
+        else:
             k_cache, v_cache, block_tables = self._materialize_cached_kv(context.block_tables, q.dtype)
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=block_tables,
-                                        softmax_scale=self.scale, causal=True)
+            o = flash_attn_with_kvcache(
+                q.unsqueeze(1),
+                k_cache,
+                v_cache,
+                cache_seqlens=context.context_lens,
+                block_table=block_tables,
+                softmax_scale=self.scale,
+                causal=True,
+            )
         return o

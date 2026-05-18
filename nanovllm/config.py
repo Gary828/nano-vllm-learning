@@ -5,7 +5,7 @@ from transformers import AutoConfig
 from nanovllm.layers.kv_quant import normalize_kv_cache_quant_dtype
 
 
-@dataclass
+@dataclass(slots=True)
 class Config:
     model: str
     max_num_batched_tokens: int = 16384

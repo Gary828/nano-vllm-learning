@@ -1,8 +1,9 @@
 from dataclasses import dataclass
+
 import torch
 
 
-@dataclass
+@dataclass(slots=True)
 class Context:
     is_prefill: bool = False
     cu_seqlens_q: torch.Tensor | None = None
@@ -15,10 +16,13 @@ class Context:
     local_block_tables: torch.Tensor | None = None
     unique_blocks: torch.Tensor | None = None
 
+
 _CONTEXT = Context()
+
 
 def get_context():
     return _CONTEXT
+
 
 def set_context(
     is_prefill,
@@ -45,6 +49,7 @@ def set_context(
         local_block_tables,
         unique_blocks,
     )
+
 
 def reset_context():
     global _CONTEXT
