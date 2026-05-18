@@ -4,7 +4,7 @@ import pytest
 from collections import deque
 
 from nanovllm.engine.block_manager import BlockManager, Block
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.config import Config
@@ -187,6 +187,7 @@ class TestSchedulerSafetyAndProgress:
         cfg.num_kvcache_blocks = num_blocks
         cfg.kvcache_block_size = 256
         cfg.cache_aware = True
+        cfg.running_first = True
         cfg.max_model_len = max_model_len
         cfg.max_num_batched_tokens = max_num_batched_tokens
         return Scheduler(cfg)
@@ -220,3 +221,66 @@ class TestSchedulerSafetyAndProgress:
         scheduler.add(self._make_seq([1] * 300))
         with pytest.raises(RuntimeError):
             scheduler.schedule()
+
+
+class TestRunningFirstFairness:
+
+    def _make_scheduler(
+        self,
+        running_first=True,
+        num_blocks=32,
+        max_model_len=4096,
+        max_num_batched_tokens=1024,
+    ):
+        class FakeConfig:
+            pass
+
+        cfg = FakeConfig()
+        cfg.max_num_seqs = 32
+        cfg.eos = -1
+        cfg.num_kvcache_blocks = num_blocks
+        cfg.kvcache_block_size = 256
+        cfg.cache_aware = True
+        cfg.running_first = running_first
+        cfg.max_model_len = max_model_len
+        cfg.max_num_batched_tokens = max_num_batched_tokens
+        return Scheduler(cfg)
+
+    def _make_seq(self, token_ids):
+        return Sequence(token_ids, SamplingParams(temperature=0.6, max_tokens=8))
+
+    def test_running_first_alternates_decode_and_prefill_under_mixed_load(self):
+        scheduler = self._make_scheduler(running_first=True, max_num_batched_tokens=1024)
+        # Existing running request
+        running_seq = self._make_seq([7] * 300)
+        scheduler.block_manager.allocate(running_seq)
+        running_seq.status = SequenceStatus.RUNNING
+        scheduler.running.append(running_seq)
+        # New waiting request
+        waiting_seq = self._make_seq([8] * 300)
+        scheduler.add(waiting_seq)
+
+        # First mixed step should prioritize decode.
+        seqs1, is_prefill1 = scheduler.schedule()
+        assert is_prefill1 is False
+        assert seqs1 == [running_seq]
+        assert waiting_seq in scheduler.waiting
+
+        # Next mixed step should prioritize prefill.
+        seqs2, is_prefill2 = scheduler.schedule()
+        assert is_prefill2 is True
+        assert waiting_seq in seqs2
+        assert waiting_seq in scheduler.running
+
+    def test_disable_running_first_prefers_prefill_under_mixed_load(self):
+        scheduler = self._make_scheduler(running_first=False, max_num_batched_tokens=1024)
+        running_seq = self._make_seq([7] * 300)
+        scheduler.block_manager.allocate(running_seq)
+        running_seq.status = SequenceStatus.RUNNING
+        scheduler.running.append(running_seq)
+        waiting_seq = self._make_seq([8] * 300)
+        scheduler.add(waiting_seq)
+
+        seqs, is_prefill = scheduler.schedule()
+        assert is_prefill is True
+        assert waiting_seq in seqs

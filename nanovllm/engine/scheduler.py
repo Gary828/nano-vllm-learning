@@ -12,6 +12,8 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos if isinstance(config.eos, set) else {config.eos}
+        self.running_first = getattr(config, "running_first", True)
+        self._prefill_turn = False
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -64,9 +66,46 @@ class Scheduler:
                 return picked
         return None
 
+    def _should_run_prefill_first(self) -> bool:
+        """Choose whether this step should run prefill when both queues are non-empty."""
+        if not self.waiting:
+            return False
+        if not self.running:
+            return True
+        if not self.running_first:
+            return True
+        # Alternate prefill/decode turns under mixed load.
+        # Default starts from decode when both queues first coexist.
+        prefill_first = self._prefill_turn
+        self._prefill_turn = not self._prefill_turn
+        return prefill_first
+
     def schedule(self) -> tuple[list[Sequence], bool]:
         if self.cache_aware and self.waiting:
             self._sort_waiting_by_prefix()
+
+        prefill_first = self._should_run_prefill_first()
+
+        # decode (running-first path)
+        if not prefill_first:
+            scheduled_decode = []
+            num_decode = 0
+            while self.running and num_decode < self.max_num_seqs:
+                seq = self.running.popleft()
+                while not self.block_manager.can_append(seq):
+                    if self.running:
+                        self.preempt(self.running.pop())
+                    else:
+                        self.preempt(seq)
+                        break
+                else:
+                    num_decode += 1
+                    self.block_manager.may_append(seq)
+                    scheduled_decode.append(seq)
+            if scheduled_decode:
+                self.running.extendleft(reversed(scheduled_decode))
+                return scheduled_decode, False
+
         # prefill
         scheduled_seqs = []
         num_seqs = 0
