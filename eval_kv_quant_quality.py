@@ -86,7 +86,8 @@ def main():
         help="Run quality checks with eager execution for deterministic behavior across modes.",
     )
     args = parser.parse_args()
-
+    print("args:\n")
+    print(args)
     if not os.path.exists(args.model_path):
         print(f"Error: model not found at {args.model_path}")
         return
