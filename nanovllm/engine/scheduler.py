@@ -128,6 +128,9 @@ class Scheduler:
 
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             seq.is_prefill = True
+            # Publish hashes for fully-covered blocks in this prefill slice
+            # so later requests in the same scheduling step can reuse them.
+            self.block_manager.hash_blocks(seq)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING

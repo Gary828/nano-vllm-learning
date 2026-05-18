@@ -22,7 +22,7 @@
 - 已验证：
   - Qwen3-0.6B / 1.7B / 4B / 8B / 14B / 30B（含 FP8 KV cache）
   - MiniCPM4.1-0.5B / 8B
-  - Llama（见 PR-88 适配说明）
+  - Llama
 
 ## Model Download
 

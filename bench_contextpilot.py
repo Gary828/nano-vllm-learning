@@ -232,11 +232,12 @@ def simulate_prompt_packing(
                 predicted_new = max(predicted_new, 1)
             else:
                 predicted_new = len(seq)
-            if predicted_new_total + predicted_new > max_num_batched_tokens or not bm.can_allocate(seq):
+            num_cached_blocks = bm.can_allocate(seq)
+            if predicted_new_total + predicted_new > max_num_batched_tokens or num_cached_blocks == -1:
                 break
 
             seq = waiting.popleft()
-            bm.allocate(seq)
+            bm.allocate(seq, num_cached_blocks)
             actual_new = len(seq) - seq.num_cached_tokens
             batch.append(seq)
             predicted_new_total += predicted_new
