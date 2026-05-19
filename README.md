@@ -1,10 +1,3 @@
-<p align="center">
-<img width="300" src="assets/logo.png">
-</p>
-
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
 
 # Nano-vLLM
 
@@ -78,17 +71,6 @@ llm = LLM("/YOUR/MODEL/PATH", kv_cache_quant="fp8_e5m2")
 - Input Length: Randomly sampled between 100–1024 tokens
 - Output Length: Randomly sampled between 100–1024 tokens
 
-- 测试配置：
-- 硬件：RTX 4070 Laptop（8GB）
-- 模型：Qwen3-0.6B
-- 请求：256 条
-- 输入长度：100-1024 随机
-- 输出长度：100-1024 随机
-
-| Framework      | Total Tokens | Total Time | Throughput (tokens/sec) |
-|----------------|--------------|------------|--------------------------|
-| vLLM           | 133,966      | 98.37      | 1361.84                  |
-| Nano-vLLM      | 133,966      | 93.41      | 1434.13                  |
 
 ### ContextPilot + cache-aware scheduling
 
