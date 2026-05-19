@@ -96,7 +96,3 @@ llm = LLM("/YOUR/MODEL/PATH", kv_cache_quant="fp8_e5m2")
 - [`docs/kv_cache_quant_interview.md`](docs/kv_cache_quant_interview.md)：KV cache quant 设计与 benchmark 解读
 - [`docs/nanovllm_minicpm41_interview.md`](docs/nanovllm_minicpm41_interview.md)：MiniCPM 支持说明
 - [`docs/llama_main_qwen3_minicpm41_adaptation.md`](docs/pr88_llama_main_qwen3_minicpm41_adaptation.md)：Qwen3 / Llama / MiniCPM4.1 模型支持演进分析
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
