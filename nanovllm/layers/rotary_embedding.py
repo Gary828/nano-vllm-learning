@@ -1,4 +1,5 @@
 import math
+
 import torch
 from torch import nn
 
@@ -131,18 +132,27 @@ class RotaryEmbedding(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        seq_len = positions.max().item() + 1
-        if self.rope_type == "longrope":
-            if seq_len > self.original_max_position_embeddings:
-                cos_sin = self.cos_sin_cache_long[positions]
-            else:
+        # Avoid host sync during CUDA graph capture. For static/default RoPE
+        # paths we can index directly without reading tensor values on CPU.
+        if torch.cuda.is_current_stream_capturing():
+            if self.rope_type == "longrope":
+                # Warmup/capture uses fixed shapes within configured max length.
                 cos_sin = self.cos_sin_cache_short[positions]
+            else:
+                cos_sin = self.cos_sin_cache[positions]
         else:
-            if self.rope_type == "dynamic" and seq_len > self.max_seq_len_cached:
-                inv_freq = self._compute_dynamic_inv_freq(seq_len)
-                self.cos_sin_cache = self._build_cache(seq_len, inv_freq)
-                self.max_seq_len_cached = seq_len
-            cos_sin = self.cos_sin_cache[positions]
+            seq_len = positions.max().item() + 1
+            if self.rope_type == "longrope":
+                if seq_len > self.original_max_position_embeddings:
+                    cos_sin = self.cos_sin_cache_long[positions]
+                else:
+                    cos_sin = self.cos_sin_cache_short[positions]
+            else:
+                if self.rope_type == "dynamic" and seq_len > self.max_seq_len_cached:
+                    inv_freq = self._compute_dynamic_inv_freq(seq_len)
+                    self.cos_sin_cache = self._build_cache(seq_len, inv_freq)
+                    self.max_seq_len_cached = seq_len
+                cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         query = apply_rotary_emb(query, cos, sin)
         key = apply_rotary_emb(key, cos, sin)
