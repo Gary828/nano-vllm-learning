@@ -157,16 +157,6 @@ def quantize_store_int8_kernel(
     tl.store(scale_loc, scale)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_D": 64}, num_warps=2, num_stages=1),
-        triton.Config({"BLOCK_D": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=2),
-    ],
-    key=["head_dim", "block_size_tokens"],
-)
 @triton.jit
 def quantize_store_int8_pair_kernel(
     k_in_ptr,
@@ -578,75 +568,9 @@ def _quantize_store_int8_pair_fused(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> bool:
-    if (
-        not key.is_cuda
-        or not value.is_cuda
-        or not slots.is_cuda
-        or not k_cache.is_cuda
-        or not v_cache.is_cuda
-        or not k_scale.is_cuda
-        or not v_scale.is_cuda
-    ):
-        return False
-    if (
-        key.dtype not in (torch.float16, torch.bfloat16, torch.float32)
-        or value.dtype not in (torch.float16, torch.bfloat16, torch.float32)
-        or slots.dtype not in (torch.int32, torch.int64)
-        or k_cache.dtype != torch.int8
-        or v_cache.dtype != torch.int8
-        or k_scale.dtype != torch.float32
-        or v_scale.dtype != torch.float32
-    ):
-        return False
-    if key.shape != value.shape or key.dim() != 3:
-        return False
-    if slots.dim() != 1 or slots.numel() != key.size(0):
-        return False
-
-    if not key.is_contiguous():
-        key = key.contiguous()
-    if not value.is_contiguous():
-        value = value.contiguous()
-    if not slots.is_contiguous():
-        slots = slots.contiguous()
-
-    n, num_heads, head_dim = key.shape
-    if n == 0:
-        return True
-    grid = (n, num_heads)
-
-    flat_k_cache = k_cache.view(-1, k_cache.size(-2), k_cache.size(-1))
-    flat_v_cache = v_cache.view(-1, v_cache.size(-2), v_cache.size(-1))
-    flat_k_scale = k_scale.view(-1, k_scale.size(-1))
-    flat_v_scale = v_scale.view(-1, v_scale.size(-1))
-    quantize_store_int8_pair_kernel[grid](
-        key,
-        key.stride(0),
-        key.stride(1),
-        key.stride(2),
-        value,
-        value.stride(0),
-        value.stride(1),
-        value.stride(2),
-        slots,
-        flat_k_cache,
-        flat_k_cache.stride(0),
-        flat_k_cache.stride(1),
-        flat_k_cache.stride(2),
-        flat_v_cache,
-        flat_v_cache.stride(0),
-        flat_v_cache.stride(1),
-        flat_v_cache.stride(2),
-        flat_k_scale,
-        flat_k_scale.stride(0),
-        flat_k_scale.stride(1),
-        flat_v_scale,
-        flat_v_scale.stride(0),
-        flat_v_scale.stride(1),
-        head_dim,
-        int(k_cache.size(1)),
-    )
-    return True
+    # Disabled due to correctness instability on real workloads.
+    # Keep fallback path as the authoritative implementation.
+    return False
 
 
 def build_local_block_tables(block_tables: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
