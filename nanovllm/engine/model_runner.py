@@ -140,6 +140,7 @@ class ModelRunner:
                 num_kv_heads,
                 head_dim,
                 config.kv_cache_quant,
+                fp8_use_scale=config.kv_cache_fp8_use_scale,
             )
         else:
             model_dtype = getattr(hf_config, "torch_dtype", getattr(hf_config, "dtype", torch.get_default_dtype()))
@@ -177,7 +178,10 @@ class ModelRunner:
             )
 
         self.kv_scale = None
-        if config.kv_cache_quant and kv_cache_quant_uses_scale(config.kv_cache_quant):
+        if config.kv_cache_quant and kv_cache_quant_uses_scale(
+            config.kv_cache_quant,
+            fp8_use_scale=config.kv_cache_fp8_use_scale,
+        ):
             self.kv_scale = torch.empty(
                 2,
                 hf_config.num_hidden_layers,

@@ -23,6 +23,12 @@ def test_estimate_fp8_block_bytes_smaller_than_int8():
     assert fp8_bytes < int8_bytes
 
 
+def test_estimate_fp8_block_bytes_with_scale():
+    fp8_no_scale = estimate_quantized_block_bytes(4, 256, 8, 64, "fp8_e4m3fn", fp8_use_scale=False)
+    fp8_with_scale = estimate_quantized_block_bytes(4, 256, 8, 64, "fp8_e4m3fn", fp8_use_scale=True)
+    assert fp8_with_scale > fp8_no_scale
+
+
 def test_normalize_kv_cache_quant_dtype():
     assert normalize_kv_cache_quant_dtype(False) is None
     assert normalize_kv_cache_quant_dtype(None) is None
@@ -76,7 +82,7 @@ def test_store_kvcache_fp8_roundtrip_small():
     value = key * 0.5
     slot_mapping = torch.tensor([0, 5], dtype=torch.int32)
 
-    store_kvcache_fp8(key, value, k_cache, v_cache, slot_mapping, "fp8_e4m3fn")
+    store_kvcache_fp8(key, value, k_cache, v_cache, None, None, slot_mapping, "fp8_e4m3fn")
 
     block_tables = torch.tensor([[0, 1]], dtype=torch.int32)
     k_fp, v_fp, local_block_tables = materialize_paged_kvcache(
@@ -94,6 +100,55 @@ def test_store_kvcache_fp8_roundtrip_small():
     assert torch.allclose(v_fp[0, 0], value[0], atol=0.25)
     assert torch.allclose(k_fp[1, 1], key[1], atol=0.25)
     assert torch.allclose(v_fp[1, 1], value[1], atol=0.25)
+
+
+def test_store_kvcache_fp8_with_scale_roundtrip_small():
+    num_blocks, block_size, num_heads, head_dim = 2, 4, 2, 4
+    k_cache = torch.zeros(num_blocks, block_size, num_heads, head_dim, dtype=torch.float8_e4m3fn)
+    v_cache = torch.zeros_like(k_cache)
+    k_scale = torch.zeros(num_blocks, block_size, num_heads, dtype=torch.float32)
+    v_scale = torch.zeros_like(k_scale)
+
+    key = torch.tensor([
+        [[600.0, -512.0, 3.5, -4.0], [0.5, -0.5, 0.25, -0.25]],
+        [[2.0, 1.0, -1.0, -2.0], [4.0, -4.0, 2.0, -2.0]],
+    ])
+    value = key * 0.5
+    slot_mapping = torch.tensor([0, 5], dtype=torch.int32)
+
+    store_kvcache_fp8(
+        key,
+        value,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        slot_mapping,
+        "fp8_e4m3fn",
+    )
+
+    block_tables = torch.tensor([[0, 1]], dtype=torch.int32)
+    k_fp, v_fp, local_block_tables = materialize_paged_kvcache(
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        block_tables,
+        torch.float32,
+        "fp8_e4m3fn",
+    )
+
+    assert torch.equal(local_block_tables, torch.tensor([[0, 1]], dtype=torch.int32))
+    flat_k_scale = k_scale.view(-1, num_heads)
+    flat_v_scale = v_scale.view(-1, num_heads)
+    written_scales_k = torch.index_select(flat_k_scale, 0, slot_mapping.to(torch.int64))
+    written_scales_v = torch.index_select(flat_v_scale, 0, slot_mapping.to(torch.int64))
+    assert torch.all(written_scales_k > 0)
+    assert torch.all(written_scales_v > 0)
+    assert torch.allclose(k_fp[0, 0], key[0], atol=2.0, rtol=0.02)
+    assert torch.allclose(v_fp[0, 0], value[0], atol=1.0, rtol=0.02)
+    assert torch.allclose(k_fp[1, 1], key[1], atol=0.5, rtol=0.02)
+    assert torch.allclose(v_fp[1, 1], value[1], atol=0.5, rtol=0.02)
 
 
 def test_materialize_paged_kvcache_ignores_padding_and_remaps():
@@ -230,5 +285,35 @@ def test_materialize_quantized_blocks_fp8_subset():
 
     expected_k = torch.index_select(k_cache.float(), 0, block_ids)
     expected_v = torch.index_select(v_cache.float(), 0, block_ids)
+    assert torch.allclose(k_fp.float(), expected_k, atol=1e-2)
+    assert torch.allclose(v_fp.float(), expected_v, atol=1e-2)
+
+
+def test_materialize_quantized_blocks_fp8_with_scale_subset():
+    k_cache = torch.tensor(
+        [
+            [[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]],
+            [[[9.0, 10.0], [11.0, 12.0]], [[13.0, 14.0], [15.0, 16.0]]],
+            [[[17.0, 18.0], [19.0, 20.0]], [[21.0, 22.0], [23.0, 24.0]]],
+        ],
+        dtype=torch.float32,
+    ).to(torch.float8_e4m3fn)
+    v_cache = (k_cache.float() * 0.5).to(torch.float8_e4m3fn)
+    k_scale = torch.full((3, 2, 2), 2.0, dtype=torch.float32)
+    v_scale = torch.full((3, 2, 2), 4.0, dtype=torch.float32)
+    block_ids = torch.tensor([2, 0], dtype=torch.int64)
+
+    k_fp, v_fp = materialize_quantized_blocks(
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        block_ids,
+        torch.float32,
+        "fp8_e4m3fn",
+    )
+
+    expected_k = torch.index_select(k_cache.float(), 0, block_ids) * 2.0
+    expected_v = torch.index_select(v_cache.float(), 0, block_ids) * 4.0
     assert torch.allclose(k_fp.float(), expected_k, atol=1e-2)
     assert torch.allclose(v_fp.float(), expected_v, atol=1e-2)

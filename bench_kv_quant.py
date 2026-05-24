@@ -41,8 +41,9 @@ class KvPathProfiler(AbstractContextManager):
         "build_local_block_tables",
     )
 
-    def __init__(self, enabled: bool):
+    def __init__(self, enabled: bool, nvtx_enabled: bool = False):
         self.enabled = enabled
+        self.nvtx_enabled = nvtx_enabled and torch.cuda.is_available() and hasattr(torch.cuda, "nvtx")
         self._module = None
         self._orig: dict[str, object] = {}
         self._stats: dict[str, dict[str, float | int]] = {}
@@ -63,13 +64,19 @@ class KvPathProfiler(AbstractContextManager):
 
             def _wrap(fn_name, fn_impl):
                 def _wrapped(*args, **kwargs):
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    t0 = time.perf_counter()
-                    out = fn_impl(*args, **kwargs)
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    dt = time.perf_counter() - t0
+                    if self.nvtx_enabled:
+                        torch.cuda.nvtx.range_push(f"kvq::{fn_name}")
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        t0 = time.perf_counter()
+                        out = fn_impl(*args, **kwargs)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        dt = time.perf_counter() - t0
+                    finally:
+                        if self.nvtx_enabled:
+                            torch.cuda.nvtx.range_pop()
                     row = self._stats.setdefault(fn_name, {"calls": 0, "total_s": 0.0})
                     row["calls"] = int(row["calls"]) + 1
                     row["total_s"] = float(row["total_s"]) + dt
@@ -103,6 +110,30 @@ class KvPathProfiler(AbstractContextManager):
         return rows
 
 
+class NvtxRange(AbstractContextManager):
+
+    def __init__(self, enabled: bool, name: str):
+        self.enabled = enabled and torch.cuda.is_available() and hasattr(torch.cuda, "nvtx")
+        self.name = name
+
+    def __enter__(self):
+        if self.enabled:
+            torch.cuda.nvtx.range_push(self.name)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.enabled:
+            torch.cuda.nvtx.range_pop()
+        return False
+
+
+def _build_profiler_activities():
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    return activities
+
+
 def run_case(
     model_path: str,
     prompts: list[list[int]],
@@ -111,14 +142,24 @@ def run_case(
     max_model_len: int,
     max_num_batched_tokens: int,
     enforce_eager: bool,
+    kv_cache_fp8_use_scale: bool = False,
+    enable_nvtx: bool = False,
+    torch_profile: bool = False,
+    torch_profile_dir: str = "profiles/torch_profiler",
+    torch_profile_row_limit: int = 30,
+    torch_profile_record_shapes: bool = False,
+    torch_profile_memory: bool = True,
+    torch_profile_with_stack: bool = False,
     profile_kv_path: bool = False,
 ):
     quant_mode = normalize_kv_cache_quant_dtype(kv_cache_quant)
+    mode_name = quant_mode or "baseline"
     torch.cuda.empty_cache()
     llm = LLM(
         model_path,
         enforce_eager=enforce_eager,
         kv_cache_quant=quant_mode,
+        kv_cache_fp8_use_scale=kv_cache_fp8_use_scale,
         max_model_len=max_model_len,
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=len(prompts),
@@ -128,10 +169,31 @@ def run_case(
     init_reserved = torch.cuda.memory_reserved()
     torch.cuda.reset_peak_memory_stats()
 
-    with KvPathProfiler(profile_kv_path) as kv_profiler:
-        t0 = time.perf_counter()
-        result = llm.generate(prompts, sampling_params, use_tqdm=False, use_context_optimizer=False)
-        elapsed = time.perf_counter() - t0
+    with NvtxRange(enable_nvtx, f"kvq_bench::{mode_name}"):
+        with KvPathProfiler(profile_kv_path, nvtx_enabled=enable_nvtx) as kv_profiler:
+            torch_profile_trace = None
+            torch_profile_table = None
+            if torch_profile:
+                with torch.profiler.profile(
+                    activities=_build_profiler_activities(),
+                    record_shapes=torch_profile_record_shapes,
+                    profile_memory=torch_profile_memory,
+                    with_stack=torch_profile_with_stack,
+                ) as prof:
+                    with NvtxRange(enable_nvtx, f"generate::{mode_name}"):
+                        t0 = time.perf_counter()
+                        result = llm.generate(prompts, sampling_params, use_tqdm=False, use_context_optimizer=False)
+                        elapsed = time.perf_counter() - t0
+                os.makedirs(torch_profile_dir, exist_ok=True)
+                torch_profile_trace = os.path.join(torch_profile_dir, f"{mode_name}.trace.json")
+                prof.export_chrome_trace(torch_profile_trace)
+                sort_by = "self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
+                torch_profile_table = prof.key_averages().table(sort_by=sort_by, row_limit=torch_profile_row_limit)
+            else:
+                with NvtxRange(enable_nvtx, f"generate::{mode_name}"):
+                    t0 = time.perf_counter()
+                    result = llm.generate(prompts, sampling_params, use_tqdm=False, use_context_optimizer=False)
+                    elapsed = time.perf_counter() - t0
     generate_peak_allocated = torch.cuda.max_memory_allocated()
     generate_peak_reserved = torch.cuda.max_memory_reserved()
 
@@ -155,6 +217,8 @@ def run_case(
         "est_max_live_seqs": est_max_live_seqs,
         "total_output_tokens": total_output_tokens,
         "kv_profile": kv_profiler.summary() if profile_kv_path else [],
+        "torch_profile_trace": torch_profile_trace if torch_profile else None,
+        "torch_profile_table": torch_profile_table if torch_profile else None,
     }
     del llm
     torch.cuda.empty_cache()
@@ -189,6 +253,11 @@ def print_summary(results: list[dict], prompt_len: int, max_tokens: int):
                     f"    {p['name']}: calls={p['calls']}, "
                     f"total={p['total_s']:.3f}s, avg={p['avg_ms']:.3f}ms"
                 )
+        if row.get("torch_profile_trace"):
+            print(f"  torch-profile trace: {row['torch_profile_trace']}")
+        if row.get("torch_profile_table"):
+            print("  torch-profile top ops:")
+            print(row["torch_profile_table"])
 
     base = results[0]
     print()
@@ -219,13 +288,60 @@ def main():
         help="Comma-separated modes to benchmark. Supported: baseline,int8,fp8_e4m3fn,fp8_e5m2",
     )
     parser.add_argument(
+        "--kv-cache-fp8-use-scale",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable explicit fp8 k/v scale tensors (for fp8 modes only).",
+    )
+    parser.add_argument(
+        "--enable-nvtx",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Emit NVTX ranges around benchmark + kv quant path (use with nsys --trace=nvtx).",
+    )
+    parser.add_argument(
+        "--torch-profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable torch.profiler and export chrome trace.",
+    )
+    parser.add_argument(
+        "--torch-profile-dir",
+        default="profiles/torch_profiler",
+        help="Output directory for torch.profiler trace files.",
+    )
+    parser.add_argument(
+        "--torch-profile-row-limit",
+        type=int,
+        default=30,
+        help="Row limit for torch.profiler top operators table.",
+    )
+    parser.add_argument(
+        "--torch-profile-record-shapes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable record_shapes in torch.profiler (higher overhead).",
+    )
+    parser.add_argument(
+        "--torch-profile-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable profile_memory in torch.profiler.",
+    )
+    parser.add_argument(
+        "--torch-profile-with-stack",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable with_stack in torch.profiler (high overhead).",
+    )
+    parser.add_argument(
         "--profile-kv-path",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Collect lightweight per-function timing for kv quant path.",
     )
     args = parser.parse_args()
-
+    print(args)
     if not os.path.exists(args.model_path):
         print(f"Error: model not found at {args.model_path}")
         return
@@ -250,6 +366,14 @@ def main():
             max_model_len,
             max_num_batched_tokens,
             args.enforce_eager,
+            args.kv_cache_fp8_use_scale,
+            args.enable_nvtx,
+            args.torch_profile,
+            args.torch_profile_dir,
+            args.torch_profile_row_limit,
+            args.torch_profile_record_shapes,
+            args.torch_profile_memory,
+            args.torch_profile_with_stack,
             args.profile_kv_path,
         )
         for mode in modes

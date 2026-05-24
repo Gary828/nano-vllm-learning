@@ -30,8 +30,21 @@ def get_kv_cache_storage_dtype(mode) -> torch.dtype | None:
     return KV_CACHE_QUANT_DTYPES[mode]
 
 
-def kv_cache_quant_uses_scale(mode) -> bool:
-    return normalize_kv_cache_quant_dtype(mode) == "int8"
+def kv_cache_quant_uses_scale(mode, fp8_use_scale: bool = False) -> bool:
+    mode = normalize_kv_cache_quant_dtype(mode)
+    if mode == "int8":
+        return True
+    if mode in ("fp8_e4m3fn", "fp8_e5m2") and fp8_use_scale:
+        return True
+    return False
+
+
+def _get_fp8_qmax(cache_dtype: torch.dtype) -> float:
+    if cache_dtype == torch.float8_e4m3fn:
+        return 448.0
+    if cache_dtype == torch.float8_e5m2:
+        return 57344.0
+    raise AssertionError(f"unsupported fp8 cache dtype: {cache_dtype}")
 
 
 @triton.jit
@@ -540,6 +553,42 @@ def _store_fp8_pair_fused(
     return True
 
 
+def _dequantize_fp8_with_scale(
+    cache: torch.Tensor,
+    scale: torch.Tensor,
+    block_ids: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    # float8 CUDA kernels do not support index_select directly, so cast first.
+    fp32_cache = cache.to(torch.float32)
+    fp32_selected = torch.index_select(fp32_cache, 0, block_ids)
+    scale_selected = torch.index_select(scale, 0, block_ids).unsqueeze(-1)
+    fp32_selected.mul_(scale_selected)
+    return fp32_selected.to(out_dtype).contiguous()
+
+
+def _quantize_store_fp8_with_scale(
+    x: torch.Tensor,
+    cache_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x_fp32 = x.to(torch.float32)
+    qmax = _get_fp8_qmax(cache_dtype)
+    scale_out = x_fp32.abs().amax(dim=-1).clamp_min(1e-8) / qmax
+    x_scaled = x_fp32 / scale_out.unsqueeze(-1)
+    x_q = x_scaled.to(cache_dtype)
+    return x_q, scale_out
+
+
+def _scatter_fp8_rows_by_slots(
+    flat_cache: torch.Tensor,
+    slots: torch.Tensor,
+    rows: torch.Tensor,
+):
+    # float8 does not support index_put on this PyTorch build.
+    for idx, slot in enumerate(slots.tolist()):
+        flat_cache[slot].copy_(rows[idx])
+
+
 def _workspace_view(
     workspace: dict,
     name: str,
@@ -614,6 +663,11 @@ def materialize_quantized_blocks(
         v_fp = v_fp32.to(out_dtype).contiguous()
         return k_fp, v_fp
 
+    if k_scale is not None and v_scale is not None:
+        k_fp = _dequantize_fp8_with_scale(k_cache, k_scale, block_ids, out_dtype)
+        v_fp = _dequantize_fp8_with_scale(v_cache, v_scale, block_ids, out_dtype)
+        return k_fp, v_fp
+
     k_fp = _gather_cast_fp8_fused(k_cache, block_ids, out_dtype)
     v_fp = _gather_cast_fp8_fused(v_cache, block_ids, out_dtype)
     if k_fp is not None and v_fp is not None:
@@ -630,13 +684,14 @@ def estimate_quantized_block_bytes(
     num_kv_heads: int,
     head_dim: int,
     quant_dtype: str = "int8",
+    fp8_use_scale: bool = False,
 ) -> int:
     storage_dtype = get_kv_cache_storage_dtype(quant_dtype)
     assert storage_dtype is not None
     storage_bytes = torch.tensor([], dtype=storage_dtype).element_size()
     kv_bytes = 2 * num_hidden_layers * block_size * num_kv_heads * head_dim * storage_bytes
     scale_bytes = 0
-    if kv_cache_quant_uses_scale(quant_dtype):
+    if kv_cache_quant_uses_scale(quant_dtype, fp8_use_scale=fp8_use_scale):
         scale_bytes = (
             2
             * num_hidden_layers
@@ -753,6 +808,8 @@ def store_kvcache_fp8(
     value: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
     slot_mapping: torch.Tensor,
     quant_dtype: str,
     workspace: dict | None = None,
@@ -781,7 +838,8 @@ def store_kvcache_fp8(
             slots_i32.copy_(slots.to(torch.int32))
             slots = slots_i32
 
-    if _store_fp8_pair_fused(key, value, slots, k_cache, v_cache):
+    use_scale = k_scale is not None and v_scale is not None
+    if not use_scale and _store_fp8_pair_fused(key, value, slots, k_cache, v_cache):
         return
 
     valid = slot_mapping != -1
@@ -790,6 +848,8 @@ def store_kvcache_fp8(
     cache_dtype = get_kv_cache_storage_dtype(quant_dtype)
     flat_k_cache = k_cache.view(-1, k_cache.size(-2), k_cache.size(-1))
     flat_v_cache = v_cache.view(-1, v_cache.size(-2), v_cache.size(-1))
+    flat_k_scale = None if k_scale is None else k_scale.view(-1, k_scale.size(-1))
+    flat_v_scale = None if v_scale is None else v_scale.view(-1, v_scale.size(-1))
     if bool(torch.all(valid)):
         slots_l = slot_mapping.to(torch.int64)
         key_valid = key
@@ -827,11 +887,20 @@ def store_kvcache_fp8(
             torch.index_select(key, 0, valid_idx, out=key_valid)
             torch.index_select(value, 0, valid_idx, out=value_valid)
             slots_l = slots_tmp.to(torch.int64)
+    if use_scale:
+        assert flat_k_scale is not None and flat_v_scale is not None
+        key_fp8, key_scale = _quantize_store_fp8_with_scale(key_valid, cache_dtype)
+        value_fp8, value_scale = _quantize_store_fp8_with_scale(value_valid, cache_dtype)
+        _scatter_fp8_rows_by_slots(flat_k_cache, slots_l, key_fp8)
+        _scatter_fp8_rows_by_slots(flat_v_cache, slots_l, value_fp8)
+        flat_k_scale[slots_l] = key_scale
+        flat_v_scale[slots_l] = value_scale
+        return
+
     key_fp8 = key_valid.to(cache_dtype)
     value_fp8 = value_valid.to(cache_dtype)
-    for idx, slot in enumerate(slots_l.tolist()):
-        flat_k_cache[slot].copy_(key_fp8[idx])
-        flat_v_cache[slot].copy_(value_fp8[idx])
+    _scatter_fp8_rows_by_slots(flat_k_cache, slots_l, key_fp8)
+    _scatter_fp8_rows_by_slots(flat_v_cache, slots_l, value_fp8)
 
 
 def store_kvcache_quantized(
@@ -850,7 +919,17 @@ def store_kvcache_quantized(
         assert k_scale is not None and v_scale is not None
         store_kvcache_int8(key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping, workspace=workspace)
     else:
-        store_kvcache_fp8(key, value, k_cache, v_cache, slot_mapping, quant_dtype, workspace=workspace)
+        store_kvcache_fp8(
+            key,
+            value,
+            k_cache,
+            v_cache,
+            k_scale,
+            v_scale,
+            slot_mapping,
+            quant_dtype,
+            workspace=workspace,
+        )
 
 
 def materialize_paged_kvcache(
